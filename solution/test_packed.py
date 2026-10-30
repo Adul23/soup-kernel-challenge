@@ -5,7 +5,9 @@ import copy
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a CUDA GPU"
+)
 
 
 def _model():
@@ -17,19 +19,31 @@ def _model():
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     torch.manual_seed(0)
-    cfg = Qwen2Config(vocab_size=1000, hidden_size=64, intermediate_size=160,
-                      num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
-                      max_position_embeddings=128)
+    cfg = Qwen2Config(
+        vocab_size=1000,
+        hidden_size=64,
+        intermediate_size=160,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+    )
     model = Qwen2ForCausalLM(cfg).cuda()
     for p in model.parameters():
         p.requires_grad_(False)
     config = LoraConfig(r=4, lora_alpha=8, lora_dropout=0.05)
     for layer in model.model.layers:
         attn = layer.self_attn
-        attn.q_proj = LoraLinear(attn.q_proj, "default", config=config, r=4, lora_alpha=8)
-        attn.v_proj = LoraLinear(attn.v_proj, "default", config=config, r=4, lora_alpha=8)
+        attn.q_proj = LoraLinear(
+            attn.q_proj, "default", config=config, r=4, lora_alpha=8
+        )
+        attn.v_proj = LoraLinear(
+            attn.v_proj, "default", config=config, r=4, lora_alpha=8
+        )
     model = model.cuda()
-    with torch.no_grad():  # LoRA_B starts at zero; make the adapters (and dropout) matter
+    with (
+        torch.no_grad()
+    ):  # LoRA_B starts at zero; make the adapters (and dropout) matter
         for name, p in model.named_parameters():
             if "lora_B" in name:
                 p.normal_(0.0, 0.05)
@@ -59,7 +73,11 @@ def test_packed_layers_match_padded_and_keep_rng():
         try:
             torch.manual_seed(1234)
             with torch.autocast("cuda", dtype=torch.float16):
-                out = model(input_ids=ids, attention_mask=mask, labels=labels)
+                # use_cache=False as TRL sets it for training: with the config default (True)
+                # Qwen2Model builds a DynamicCache and the layers keep their padded path.
+                out = model(
+                    input_ids=ids, attention_mask=mask, labels=labels, use_cache=False
+                )
             out.loss.backward()
         finally:
             unpad.ENABLED = True
@@ -75,14 +93,23 @@ def test_packed_layers_match_padded_and_keep_rng():
         hook.remove()
 
     assert seen == [2], "layer 1 did not get the packed [n_real, hidden] stream"
-    assert torch.equal(rng_new, rng_ref), "LoRA dropout drew a different amount of randomness"
+    assert torch.equal(rng_new, rng_ref), (
+        "LoRA dropout drew a different amount of randomness"
+    )
     real = mask.bool()
-    torch.testing.assert_close(new.logits[real].float(), ref.logits[real].float(),
-                               rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(
+        new.logits[real].float(), ref.logits[real].float(), rtol=2e-3, atol=2e-3
+    )
     torch.testing.assert_close(new.loss, ref.loss, rtol=1e-3, atol=1e-4)
-    assert grads_new.keys() == grads_ref.keys() and any("lora_A" in n for n in grads_ref)
+    assert grads_new.keys() == grads_ref.keys() and any(
+        "lora_A" in n for n in grads_ref
+    )
     scale = max(g.abs().max().item() for g in grads_ref.values())
     for name, g in grads_ref.items():
-        torch.testing.assert_close(grads_new[name], g, rtol=2e-2,
-                                   atol=2e-3 * max(g.abs().max().item(), 1e-2 * scale) + 1e-8,
-                                   msg=name)
+        torch.testing.assert_close(
+            grads_new[name],
+            g,
+            rtol=2e-2,
+            atol=2e-3 * max(g.abs().max().item(), 1e-2 * scale) + 1e-8,
+            msg=name,
+        )
