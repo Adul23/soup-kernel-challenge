@@ -111,21 +111,28 @@ class NF4Linear(torch.autograd.Function):
         return grad_a, None, grad_bias, None
 
 
-def _usable(A, B, quant_state, out, bias) -> bool:
-    if not ENABLED or out is not None or quant_state is None:
-        return False
-    if not (isinstance(A, torch.Tensor) and A.is_cuda and A.dtype == torch.float16 and A.numel()):
+def weight_ok(B, quant_state) -> bool:
+    """A packed NF4 weight this kernel dequantizes exactly as bitsandbytes does."""
+    if not ENABLED or quant_state is None or not isinstance(B, torch.Tensor):
         return False
     if getattr(quant_state, "quant_type", None) != "nf4" or len(quant_state.shape) != 2:
         return False
     if quant_state.dtype not in (torch.float16, torch.float32):
         return False  # bf16 would round twice in bitsandbytes' backward; keep its path
     n, k = quant_state.shape
-    if A.shape[-1] != k or (n * k) % 2 or quant_state.blocksize % 2:
+    if (n * k) % 2 or quant_state.blocksize % 2:
         return False
     if B.dtype != torch.uint8 or B.numel() * 2 != n * k or not B.is_cuda:
         return False
-    if quant_state.nested and getattr(quant_state.state2, "blocksize", None) != 256:
+    return not quant_state.nested or getattr(quant_state.state2, "blocksize", None) == 256
+
+
+def _usable(A, B, quant_state, out, bias) -> bool:
+    if out is not None or not weight_ok(B, quant_state):
+        return False
+    if not (isinstance(A, torch.Tensor) and A.is_cuda and A.dtype == torch.float16 and A.numel()):
+        return False
+    if A.shape[-1] != quant_state.shape[1]:
         return False
     return bias is None or bias.dtype == A.dtype
 
