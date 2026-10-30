@@ -9,16 +9,26 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 
 def _model():
-    from peft import LoraConfig, get_peft_model
+    # peft's LoRA layer class is used directly: get_peft_model's dispatcher probes torchao for a
+    # plain nn.Linear, and Kaggle's preinstalled torchao 0.10 makes peft 0.20 raise there (the
+    # real run wraps bitsandbytes Linear4bit layers, which are dispatched before that probe).
+    from peft import LoraConfig
+    from peft.tuners.lora.layer import Linear as LoraLinear
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     torch.manual_seed(0)
     cfg = Qwen2Config(vocab_size=1000, hidden_size=64, intermediate_size=160,
                       num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
                       max_position_embeddings=128)
-    model = Qwen2ForCausalLM(cfg).cuda().train()
-    model = get_peft_model(model, LoraConfig(r=4, lora_alpha=8, lora_dropout=0.05,
-                                             target_modules=["q_proj", "v_proj"]))
+    model = Qwen2ForCausalLM(cfg).cuda()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    config = LoraConfig(r=4, lora_alpha=8, lora_dropout=0.05)
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        attn.q_proj = LoraLinear(attn.q_proj, "default", config=config, r=4, lora_alpha=8)
+        attn.v_proj = LoraLinear(attn.v_proj, "default", config=config, r=4, lora_alpha=8)
+    model = model.cuda()
     with torch.no_grad():  # LoRA_B starts at zero; make the adapters (and dropout) matter
         for name, p in model.named_parameters():
             if "lora_B" in name:
@@ -41,7 +51,7 @@ def test_packed_layers_match_padded_and_keep_rng():
     labels = ids.masked_fill(mask == 0, -100)
 
     seen = []
-    layer = new_model.base_model.model.model.layers[1]
+    layer = new_model.model.layers[1]
     hook = layer.register_forward_pre_hook(lambda mod, args: seen.append(args[0].dim()))
 
     def run(model, enabled):
