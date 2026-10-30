@@ -162,3 +162,56 @@ def test_metrics_follow_trl_formulas():
     assert m["entropy"][0] == pytest.approx(ent.item(), rel=1e-6)
     assert m["num_tokens"] == [10 + int(mask.sum())]
     assert m["mean_token_accuracy"][0] == pytest.approx(acc.item(), rel=1e-6)
+
+
+@cuda
+@pytest.mark.parametrize("fp16_exact", [True, False])
+def test_tied_embedding_stored_in_fp16_only_when_exact(fp16_exact):
+    import copy
+
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    head.patch_qwen2_fused_head()
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=5003, hidden_size=64, intermediate_size=160,
+                      num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                      max_position_embeddings=64, tie_word_embeddings=True)
+    ref_model = Qwen2ForCausalLM(cfg).cuda().float().train()
+    if fp16_exact:  # as after loading in fp16 and widening to fp32
+        with torch.no_grad():
+            ref_model.model.embed_tokens.weight.copy_(
+                ref_model.model.embed_tokens.weight.half().float())
+    ref_model.model.embed_tokens.weight.requires_grad_(False)
+    new_model = copy.deepcopy(ref_model)
+    assert new_model.lm_head.weight is new_model.model.embed_tokens.weight
+
+    ids = torch.randint(0, cfg.vocab_size, (3, 20), device="cuda")
+    mask = torch.ones_like(ids)
+    mask[1, 12:] = 0
+    labels = ids.masked_fill(mask == 0, -100)
+    labels[:, :3] = -100
+
+    def run(model, armed):
+        head._CTX.armed, head._CTX.step = armed, None
+        try:
+            with torch.autocast("cuda", dtype=torch.float16):
+                out = model(input_ids=ids, attention_mask=mask, labels=labels, use_cache=False)
+        finally:
+            head._CTX.armed = False
+        out.loss.backward()
+        return out.loss.detach(), {n: p.grad for n, p in model.named_parameters()
+                                   if p.grad is not None}
+
+    loss_ref, grads_ref = run(ref_model, False)
+    loss_new, grads_new = run(new_model, True)
+
+    weight = new_model.model.embed_tokens.weight
+    assert weight.dtype == (torch.float16 if fp16_exact else torch.float32)
+    assert new_model.lm_head.weight is weight
+    emb = new_model.model.embed_tokens(ids)
+    assert emb.dtype == torch.float32
+    torch.testing.assert_close(emb, ref_model.model.embed_tokens(ids), rtol=0, atol=0)
+    torch.testing.assert_close(loss_new, loss_ref, rtol=2e-3, atol=1e-4)
+    for name, g in grads_ref.items():
+        torch.testing.assert_close(grads_new[name], g, rtol=2e-2,
+                                   atol=2e-3 * g.abs().max().item() + 1e-8, msg=name)

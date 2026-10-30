@@ -247,6 +247,49 @@ def _model_can_engage(model, args, kwargs) -> bool:
     return _autocast_fp16()
 
 
+def _fp16_exact(weight: torch.Tensor, rows: int = 8192) -> bool:
+    """True when every value of the fp32 weight survives fp32 -> fp16 -> fp32 unchanged
+    (checked in row chunks, so no full-size temporary)."""
+    with torch.no_grad():
+        for start in range(0, weight.shape[0], rows):
+            part = weight[start:start + rows]
+            if not torch.equal(part.half().float(), part):
+                return False
+    return True
+
+
+def _upcast_output(module, inputs, output):
+    return output.float()
+
+
+def compact_tied_embedding(model) -> bool:
+    """Store the frozen tied embedding / head matrix in fp16 instead of fp32, once.
+
+    prepare_model_for_kbit_training widens it to fp32 (0.93 GB), and the head kept a second,
+    fp16 copy (0.47 GB). When the fp32 values are all fp16 values (the model is loaded in fp16 on
+    a T4), one fp16 tensor holds the same numbers: the head uses it directly, and the embedding
+    output is widened back to fp32 by a forward hook, so the residual stream keeps its dtype and
+    every value. Anything else (untied, trainable, not fp16-exact) is left as it is."""
+    if getattr(model, "_soup_embedding_checked", False):
+        return False
+    model._soup_embedding_checked = True
+    embed = model.get_input_embeddings()
+    head = model.get_output_embeddings()
+    weight = getattr(embed, "weight", None)
+    if (head is None or weight is None or head.weight is not weight or weight.requires_grad
+            or weight.dtype != torch.float32 or not weight.is_cuda
+            or not isinstance(embed, torch.nn.Embedding)):
+        return False
+    if not _fp16_exact(weight):
+        print("[solution.head] tied embedding is not fp16-exact: kept in fp32", flush=True)
+        return False
+    _W16.clear()  # the separate fp16 copy of the head goes away with this
+    weight.data = weight.data.to(torch.float16)
+    embed.register_forward_hook(_upcast_output)
+    print("[solution.head] tied embedding stored in fp16 (values unchanged)", flush=True)
+    return True
+
+
 def patch_qwen2_fused_head():
     from transformers.modeling_outputs import CausalLMOutputWithPast
     from transformers.models.qwen2 import modeling_qwen2
@@ -260,6 +303,7 @@ def patch_qwen2_fused_head():
     def forward(self, *args, **kwargs):
         if not _model_can_engage(self, args, kwargs):
             return original(self, *args, **kwargs)
+        compact_tied_embedding(self)
         labels = kwargs.pop("labels")
         kwargs.pop("logits_to_keep", None)
         kwargs.pop("return_dict", None)
