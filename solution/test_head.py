@@ -71,6 +71,25 @@ def test_fused_head_matches_dense(scale, chunk):
 
 
 @cuda
+@pytest.mark.parametrize("m,v,d", [(37, 9001, 64), (300, 151936, 1536), (1, 130, 1536)])
+def test_triton_gemms_match_torch(m, v, d):
+    torch.manual_seed(0)
+    a = torch.randn(m, d, device="cuda").half()
+    w = (torch.randn(v, d, device="cuda") / d ** 0.5).half()
+    out = torch.empty(m, v, dtype=torch.float16, device="cuda")
+    head.head_logits(out, a, w)
+    ref = a @ w.t()
+    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
+
+    g = (torch.randn(m, v, device="cuda") / v ** 0.5).half()
+    dh = head.head_grad(g, w)
+    ref_dh = g.float() @ w.float()
+    assert dh.dtype == torch.float32
+    torch.testing.assert_close(dh, ref_dh, rtol=1e-3, atol=1e-3)
+    assert head._GEMM["triton"], "Triton GEMMs fell back to cuBLAS: check 4 would lose them"
+
+
+@cuda
 def test_argmax_ties_take_first_index_across_blocks():
     v, dim = 9001, 64
     w = torch.zeros(v, dim, device="cuda")

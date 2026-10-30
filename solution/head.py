@@ -5,15 +5,18 @@ fp16 logits [B, T, V] are upcast to fp32 by ForCausalLMLoss, TRL reads them agai
 token accuracy, Soup's rewind recorder reads them a third time for per-row losses, and backward
 keeps fp32 and fp16 gradients of the same shape. With V = 151 936 that is gigabytes at the peak.
 
-Here, during training only:
-- cuBLAS computes the logits of up to CHUNK tokens at a time into one reused fp16 buffer, exactly
-  as autocast would (fp16 inputs, fp32 accumulation, fp16 output);
+Here, during training only (three Triton kernels of ours):
+- `head_logits_kernel` computes the logits of up to CHUNK tokens at a time into one reused fp16
+  buffer, as autocast would (fp16 inputs, fp32 accumulation, fp16 output);
 - our Triton kernel `fused_head_ce_kernel` reads each row once and computes, in fp32, an online
   max / sum-exp (log-sum-exp), the entropy, the first-index argmax and the target logit; for
   labelled rows a second pass writes d(loss)/d(logits) = softmax - onehot back into the buffer,
   scaled by GRAD_SCALE so small probabilities do not flush to zero in fp16;
-- cuBLAS multiplies that gradient by the head weight to get the hidden-state gradient, which is
-  kept (fp32, [B*T, hidden], ~12 MB) and handed to autograd in backward.
+- `head_grad_kernel` (split-K, fp32 accumulation) multiplies that gradient by the head weight to
+  get the hidden-state gradient, which is kept (fp32, [B*T, hidden], ~12 MB) and handed to
+  autograd in backward.
+If the Triton GEMMs cannot compile on the GPU, both fall back to cuBLAS with a warning
+(test_head.py fails in that case, so it is seen before a measured run).
 Pad positions are skipped entirely; prompt positions only need entropy (no gradient pass).
 
 The trainer side keeps every Soup output: TRL's `entropy`, `num_tokens`, `mean_token_accuracy`
@@ -94,6 +97,112 @@ def fused_head_ce_kernel(LOGITS, stride_row, TARGET, LOSS, ENTROPY, CORRECT, V,
             tl.store(ptr + offs, g.to(LOGITS.dtype.element_ty), mask=msk)
 
 
+@triton.jit
+def head_logits_kernel(A, W, C, M, N, K, stride_am, stride_wn, stride_cm,
+                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """C[M, N] = A[M, K] @ W[N, K].T in fp16 with fp32 accumulation (the logits of a chunk).
+
+    Programs walk the M tiles fastest, so one W tile (the 467 MB operand) is read from DRAM once
+    and reused from L2 by every M tile of the chunk."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_m
+    pid_n = pid // num_m
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m_ok = rm < M
+    n_ok = rn < N
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        kk = k0 + rk
+        k_ok = kk < K
+        a = tl.load(A + rm[:, None].to(tl.int64) * stride_am + kk[None, :],
+                    mask=m_ok[:, None] & k_ok[None, :], other=0.0)
+        b = tl.load(W + rn[None, :].to(tl.int64) * stride_wn + kk[:, None],
+                    mask=n_ok[None, :] & k_ok[:, None], other=0.0)
+        acc += tl.dot(a, b)
+    tl.store(C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :],
+             acc.to(C.dtype.element_ty), mask=m_ok[:, None] & n_ok[None, :])
+
+
+@triton.jit
+def head_grad_kernel(G, W, P, M, N, K, K_PER_SPLIT, stride_gm, stride_wk, stride_ps, stride_pm,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """P[s] = G[:, Ks] @ W[Ks, :] for one split s of the vocabulary (split-K: N = hidden is only
+    1536 wide, so without the split there would be too few programs for 40 SMs)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m_ok = rm < M
+    n_ok = rn < N
+    k_start = pid_s * K_PER_SPLIT
+    k_end = tl.minimum(k_start + K_PER_SPLIT, K)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(k_start, k_end, BLOCK_K):
+        kk = k0 + rk
+        k_ok = kk < k_end
+        g = tl.load(G + rm[:, None].to(tl.int64) * stride_gm + kk[None, :],
+                    mask=m_ok[:, None] & k_ok[None, :], other=0.0)
+        w = tl.load(W + kk[:, None].to(tl.int64) * stride_wk + rn[None, :],
+                    mask=k_ok[:, None] & n_ok[None, :], other=0.0)
+        acc += tl.dot(g, w)
+    tl.store(P + pid_s * stride_ps + rm[:, None].to(tl.int64) * stride_pm + rn[None, :],
+             acc, mask=m_ok[:, None] & n_ok[None, :])
+
+
+GEMM_BLOCK = (64, 128, 32)  # BLOCK_M, BLOCK_N, BLOCK_K: 2 stages x 12 KB of shared memory
+SPLIT_K = 8
+_GEMM = {"triton": True}    # set to False (with a warning) if the Triton GEMMs cannot run here
+
+
+def _gemm_fallback(exc):
+    import warnings
+
+    _GEMM["triton"] = False
+    warnings.warn(f"solution.head: Triton GEMM unavailable, using cuBLAS ({exc!r})", stacklevel=3)
+
+
+def head_logits(out, a16, w16):
+    """out[c, V] = a16[c, D] @ w16[V, D].T, fp16."""
+    if _GEMM["triton"]:
+        try:
+            m, k = a16.shape
+            n = w16.shape[0]
+            bm, bn, bk = GEMM_BLOCK
+            grid = (triton.cdiv(m, bm) * triton.cdiv(n, bn),)
+            head_logits_kernel[grid](a16, w16, out, m, n, k, a16.stride(0), w16.stride(0),
+                                     out.stride(0), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
+                                     num_warps=4, num_stages=2)
+            return out
+        except Exception as exc:  # noqa: BLE001 - compile errors surface at the first launch
+            _gemm_fallback(exc)
+    return torch.mm(a16, w16.t(), out=out)
+
+
+def head_grad(g16, w16):
+    """g16[c, V] @ w16[V, D] -> fp32 [c, D]."""
+    if _GEMM["triton"]:
+        try:
+            m, k = g16.shape
+            n = w16.shape[1]
+            bm, bn, bk = GEMM_BLOCK
+            k_per_split = triton.cdiv(triton.cdiv(k, SPLIT_K), bk) * bk
+            splits = triton.cdiv(k, k_per_split)
+            part = torch.empty((splits, m, n), dtype=torch.float32, device=g16.device)
+            grid = (triton.cdiv(m, bm), triton.cdiv(n, bn), splits)
+            head_grad_kernel[grid](g16, w16, part, m, n, k, k_per_split, g16.stride(0),
+                                   w16.stride(0), part.stride(0), part.stride(1),
+                                   BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, num_warps=4, num_stages=2)
+            return part.sum(0)
+        except Exception as exc:  # noqa: BLE001
+            _gemm_fallback(exc)
+    return torch.mm(g16, w16).float()
+
+
 _W16: dict = {}
 
 
@@ -138,7 +247,7 @@ class FusedHeadLoss(torch.autograd.Function):
                     r = rows[s0:s0 + chunk]
                     c = r.numel()
                     logits = buf[:c]
-                    torch.mm(h.index_select(0, r).to(torch.float16), weight16.t(), out=logits)
+                    head_logits(logits, h.index_select(0, r).to(torch.float16), weight16)
                     t_c = tgt.index_select(0, r).contiguous()
                     loss_c = torch.empty(c, dtype=torch.float32, device=dev)
                     ent_c = torch.empty(c, dtype=torch.float32, device=dev)
@@ -152,7 +261,7 @@ class FusedHeadLoss(torch.autograd.Function):
                     token_entropy.index_copy_(0, r, ent_c)
                     correct += cor_c.sum()
                     if write_grad:
-                        grad.index_copy_(0, r, torch.mm(logits, weight16).float())
+                        grad.index_copy_(0, r, head_grad(logits, weight16))
 
             loss = token_loss.sum() / denominator
             if grad is not None:
