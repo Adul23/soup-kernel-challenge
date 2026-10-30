@@ -24,9 +24,46 @@ import functools
 
 import torch
 
-# (flat index of real tokens, batch * seq_len) for the forward pass that is running, else None.
-_ACTIVE = None
-ENABLED = True  # tests flip this to get the reference path
+ENABLED = True       # tests flip this to get the reference path
+PACK_LAYERS = True   # also keep the residual stream packed between decoder layers (packed.py)
+
+
+class State:
+    """The real tokens of the Qwen2Model forward that is running."""
+
+    def __init__(self, idx, b, t, pack):
+        self.idx, self.b, self.t = idx, b, t
+        self.n_flat = b * t
+        self.pack_layers = pack  # packed.py may keep hidden states as [n_real, hidden]
+        self._rope = {}
+
+    def gather(self, x):
+        """[B, T, d] (or [B*T, d]) -> [n_real, d]."""
+        return x.reshape(self.n_flat, x.shape[-1]).index_select(0, self.idx)
+
+    def scatter(self, x):
+        """[n_real, d] -> [B*T, d] with zeros at the pads (autograd-safe, out of place)."""
+        return x.new_zeros((self.n_flat, x.shape[-1])).index_copy(0, self.idx, x)
+
+    def rope(self, cos, sin):
+        """cos/sin [B or 1, T, d] gathered to [n_real, d], once per forward."""
+        key = (id(cos), id(sin))
+        hit = self._rope.get(key)
+        if hit is None:
+            hit = self._rope[key] = (
+                cos.expand(self.b, self.t, cos.shape[-1]).reshape(self.n_flat, -1)
+                .index_select(0, self.idx),
+                sin.expand(self.b, self.t, sin.shape[-1]).reshape(self.n_flat, -1)
+                .index_select(0, self.idx),
+                cos, sin)  # keep the originals alive so their ids stay theirs
+        return hit[0], hit[1]
+
+
+_ACTIVE: State | None = None
+
+
+def active():
+    return _ACTIVE
 
 
 def token_index(attention_mask, batch, seq_len):
@@ -77,19 +114,28 @@ def patch_qwen2_unpad():
                 b, t = ref.shape[0], ref.shape[1]
                 idx = token_index(mask, b, t)
                 if idx is not None:
-                    state = (idx.to(ref.device), b * t)
+                    pack = (PACK_LAYERS and kwargs.get("return_dict") is not False
+                            and not kwargs.get("output_hidden_states")
+                            and not kwargs.get("output_attentions"))
+                    state = State(idx.to(ref.device), b, t, pack)
         previous, _ACTIVE = _ACTIVE, state
         try:
-            return model_forward(self, *args, **kwargs)
+            out = model_forward(self, *args, **kwargs)
+            hidden = getattr(out, "last_hidden_state", None)
+            if state is not None and isinstance(hidden, torch.Tensor) and hidden.dim() == 2:
+                # packed.py kept the stream packed through the layers and the final norm:
+                # hand the usual [B, T, hidden] back, zeros at the pads.
+                out["last_hidden_state"] = state.scatter(hidden).view(state.b, state.t, -1)
+            return out
         finally:
             _ACTIVE = previous
 
     @functools.wraps(mlp_forward)
     def forward_mlp(self, x):
         state = _ACTIVE
-        if state is None or x.dim() != 3 or x.shape[0] * x.shape[1] != state[1]:
-            return mlp_forward(self, x)
-        return unpadded_call(lambda inp: mlp_forward(self, inp), x, state[0])
+        if state is None or x.dim() != 3 or x.shape[0] * x.shape[1] != state.n_flat:
+            return mlp_forward(self, x)  # also the packed [n_real, hidden] input of packed.py
+        return unpadded_call(lambda inp: mlp_forward(self, inp), x, state.idx)
 
     model_cls.forward = forward_model
     mlp_cls.forward = forward_mlp
