@@ -379,6 +379,9 @@ def patch_sft_compute_loss():
 
     @functools.wraps(original)
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        from . import warmup
+
+        warmup.wait()  # kernels compiled during model loading (no-op after the first step)
         if not _trainer_can_engage(self, inputs):
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)

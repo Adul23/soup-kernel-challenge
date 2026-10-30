@@ -6,6 +6,7 @@ reach the model and the trainer Soup builds later, and each one falls back to th
 outside the exact situation it was written for.
 """
 
+from . import warmup
 from .head import patch_fused_head
 from .mlp_fp16 import patch_qwen2_mlp_fp16
 from .mlp_recompute import patch_qwen2_mlp_recompute
@@ -23,3 +24,4 @@ def apply(model=None):  # the harness calls apply(); `model` is accepted only fo
     patch_qwen2_mlp_fp16()  # MLP activations in fp16 instead of fp32 copies, same values
     # patch_qwen2_mlp_recompute()  # 3.05x memory but -7.5% speed: off (see README)
     patch_qwen2_unpad()    # keep last: it wraps whatever Qwen2MLP.forward is installed by now
+    warmup.start()         # compile our kernels while Soup loads the model (joined at step 1)

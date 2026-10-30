@@ -12,6 +12,18 @@ from solution import head
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 
+def _assert_grads_close(new, ref):
+    """Gradients agree to fp16 noise. Scaled to the largest gradient of the model: some
+    parameters (k_proj.bias: softmax ignores a shift of all keys) have an exact gradient of
+    zero, so both runs hold only rounding noise there and a per-tensor tolerance is meaningless."""
+    assert new.keys() == ref.keys()
+    scale = max(g.abs().max().item() for g in ref.values())
+    for name, g in ref.items():
+        torch.testing.assert_close(new[name], g, rtol=2e-2,
+                                   atol=2e-3 * max(g.abs().max().item(), 1e-2 * scale) + 1e-8,
+                                   msg=name)
+
+
 def _batch(b=3, t=37, v=9001, dim=64, seed=0):
     g = torch.Generator(device="cpu").manual_seed(seed)
     w = (torch.randn(v, dim, generator=g) / dim ** 0.5).cuda()
@@ -125,10 +137,7 @@ def test_tiny_qwen2_under_autocast_matches_unpatched():
     assert step_ref is None and step is not None and new.logits is None
 
     torch.testing.assert_close(new.loss, ref.loss, rtol=2e-3, atol=1e-4)
-    assert grads_new.keys() == grads_ref.keys()
-    for name, g in grads_ref.items():
-        torch.testing.assert_close(grads_new[name], g, rtol=2e-2,
-                                   atol=2e-3 * g.abs().max().item() + 1e-8, msg=name)
+    _assert_grads_close(grads_new, grads_ref)
 
     # Soup's rewind rows: per-row mean CE from the dense logits vs from step.token_loss.
     z = ref.logits.float()
@@ -212,6 +221,4 @@ def test_tied_embedding_stored_in_fp16_only_when_exact(fp16_exact):
     assert emb.dtype == torch.float32
     torch.testing.assert_close(emb, ref_model.model.embed_tokens(ids), rtol=0, atol=0)
     torch.testing.assert_close(loss_new, loss_ref, rtol=2e-3, atol=1e-4)
-    for name, g in grads_ref.items():
-        torch.testing.assert_close(grads_new[name], g, rtol=2e-2,
-                                   atol=2e-3 * g.abs().max().item() + 1e-8, msg=name)
+    _assert_grads_close(grads_new, grads_ref)
