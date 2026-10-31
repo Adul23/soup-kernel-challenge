@@ -50,8 +50,11 @@ def _model():
     return model.train()
 
 
-def test_packed_layers_match_padded_and_keep_rng():
+@pytest.mark.parametrize("checkpoint_layers", [False, True])
+def test_packed_layers_match_padded_and_keep_rng(checkpoint_layers):
     from solution import packed, unpad
+
+    packed.CHECKPOINT_LAYERS = checkpoint_layers
 
     unpad.patch_qwen2_unpad()
     packed.patch_qwen2_packed_layers()
@@ -91,8 +94,12 @@ def test_packed_layers_match_padded_and_keep_rng():
         new, grads_new, rng_new = run(new_model, True)
     finally:
         hook.remove()
+        packed.CHECKPOINT_LAYERS = True
 
-    assert seen == [2], "layer 1 did not get the packed [n_real, hidden] stream"
+    # (a recompute calls the layer body directly, not through the module, so no second call here)
+    assert seen == [2], (
+        f"layer 1 did not get the packed [n_real, hidden] stream: {seen}"
+    )
     assert torch.equal(rng_new, rng_ref), (
         "LoRA dropout drew a different amount of randomness"
     )

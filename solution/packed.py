@@ -31,25 +31,49 @@ import torch
 from . import unpad
 
 ENABLED = True
+# Recompute each packed layer in backward instead of keeping its activations: only the layer
+# input ([n_real, hidden] fp32, ~6 KB per token) is kept per layer. Our own recomputation
+# (torch.utils.checkpoint, non-reentrant, RNG preserved so LoRA dropout replays the same masks);
+# Soup's gradient_checkpointing switch stays off. Costs a second forward of every layer.
+CHECKPOINT_LAYERS = True
 
 
 def _lora_parts(layer):
     """The vanilla LoRA adapters of a peft LoRA layer, or None if it is not one we handle."""
-    if not all(hasattr(layer, a) for a in ("base_layer", "lora_A", "lora_B", "lora_dropout",
-                                           "scaling", "active_adapters")):
+    if not all(
+        hasattr(layer, a)
+        for a in (
+            "base_layer",
+            "lora_A",
+            "lora_B",
+            "lora_dropout",
+            "scaling",
+            "active_adapters",
+        )
+    ):
         return None
     if getattr(layer, "merged", False) or getattr(layer, "disable_adapters", False):
         return None
     if not torch.is_autocast_enabled():
-        return None  # peft then casts the input to the LoRA dtype first; keep its own path
+        return (
+            None  # peft then casts the input to the LoRA dtype first; keep its own path
+        )
     parts = []
     for name in layer.active_adapters:
         if name not in layer.lora_A.keys():
             continue
-        if name in getattr(layer, "lora_variant", {}) or getattr(layer, "use_dora", {}).get(name):
+        if name in getattr(layer, "lora_variant", {}) or getattr(
+            layer, "use_dora", {}
+        ).get(name):
             return None
-        parts.append((layer.lora_A[name], layer.lora_B[name], layer.lora_dropout[name],
-                      layer.scaling[name]))
+        parts.append(
+            (
+                layer.lora_A[name],
+                layer.lora_B[name],
+                layer.lora_dropout[name],
+                layer.scaling[name],
+            )
+        )
     return parts
 
 
@@ -64,7 +88,9 @@ def _proj(layer, x, st):
     for lora_a, lora_b, dropout, scaling in parts:
         if lora_a.weight.dtype != x.dtype:
             return st.gather(layer(st.scatter(x)))
-        dropped = st.gather(dropout(st.scatter(x)))  # same draws as dropout on [B, T, hidden]
+        dropped = st.gather(
+            dropout(st.scatter(x))
+        )  # same draws as dropout on [B, T, hidden]
         result = result + lora_b(lora_a(dropped)) * scaling
     return result
 
@@ -83,11 +109,20 @@ def _attention(attn, x, attention_mask, position_embeddings, st, kwargs):
     def padded(t):  # [n, heads * d] -> [B, heads, T, d], zeros at the pads
         return st.scatter(t.reshape(n, -1)).view(st.b, st.t, -1, d).transpose(1, 2)
 
-    interface = mq.ALL_ATTENTION_FUNCTIONS.get_interface(attn.config._attn_implementation,
-                                                         mq.eager_attention_forward)
-    out, _ = interface(attn, padded(q), padded(k), padded(v), attention_mask,
-                       dropout=0.0 if not attn.training else attn.attention_dropout,
-                       scaling=attn.scaling, sliding_window=attn.sliding_window, **kwargs)
+    interface = mq.ALL_ATTENTION_FUNCTIONS.get_interface(
+        attn.config._attn_implementation, mq.eager_attention_forward
+    )
+    out, _ = interface(
+        attn,
+        padded(q),
+        padded(k),
+        padded(v),
+        attention_mask,
+        dropout=0.0 if not attn.training else attn.attention_dropout,
+        scaling=attn.scaling,
+        sliding_window=attn.sliding_window,
+        **kwargs,
+    )
     out = out.reshape(st.n_flat, -1).index_select(0, st.idx)  # [n, heads * d]
     return attn.o_proj(out)
 
@@ -103,29 +138,61 @@ def patch_qwen2_packed_layers():
     original = cls.forward
 
     @functools.wraps(original)
-    def forward(self, hidden_states, attention_mask=None, position_ids=None,
-                past_key_values=None, use_cache=False, position_embeddings=None, **kwargs):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        position_embeddings=None,
+        **kwargs,
+    ):
         st = unpad.active()
-        usable = (ENABLED and st is not None and st.pack_layers and past_key_values is None
-                  and position_embeddings is not None and self.self_attn.sliding_window is None)
+        usable = (
+            ENABLED
+            and st is not None
+            and st.pack_layers
+            and past_key_values is None
+            and position_embeddings is not None
+            and self.self_attn.sliding_window is None
+        )
         if hidden_states.dim() == 2 and st is not None and not usable:
             hidden_states = st.scatter(hidden_states).view(st.b, st.t, -1)
         if not usable:
-            return original(self, hidden_states, attention_mask=attention_mask,
-                            position_ids=position_ids, past_key_values=past_key_values,
-                            use_cache=use_cache, position_embeddings=position_embeddings,
-                            **kwargs)
+            return original(
+                self,
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
         if hidden_states.dim() == 3:  # the first layer: embeddings [B, T, hidden]
             hidden_states = st.gather(hidden_states)
-
-        residual = hidden_states
-        x = self.input_layernorm(hidden_states)
         attn_kwargs = dict(position_ids=position_ids, use_cache=use_cache, **kwargs)
-        hidden_states = residual + _attention(self.self_attn, x, attention_mask,
-                                              position_embeddings, st, attn_kwargs)
-        residual = hidden_states
-        x = self.post_attention_layernorm(hidden_states)
-        return residual + self.mlp(x)
+
+        def body(
+            h,
+        ):  # everything it needs is captured here, so a recompute does not need unpad
+            residual = h
+            x = self.input_layernorm(h)
+            h = residual + _attention(
+                self.self_attn, x, attention_mask, position_embeddings, st, attn_kwargs
+            )
+            residual = h
+            x = self.post_attention_layernorm(h)
+            return residual + self.mlp(x)
+
+        if CHECKPOINT_LAYERS and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+
+            return checkpoint(
+                body, hidden_states, use_reentrant=False, preserve_rng_state=True
+            )
+        return body(hidden_states)
 
     cls.forward = forward
     cls._soup_packed = True
