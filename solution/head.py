@@ -35,10 +35,10 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-CHUNK = 512          # tokens per logits buffer: 512 x 151 936 x 2 B = 155 MB
-BLOCK = 4096         # vocabulary entries per kernel iteration
-GRAD_SCALE = 256.0   # fp16 headroom for softmax - onehot; divided out in fp32 afterwards
-ENABLED = True       # tests flip this to get the reference path
+CHUNK = 128  # tokens per logits buffer: 512 x 151 936 x 2 B = 155 MB
+BLOCK = 4096  # vocabulary entries per kernel iteration
+GRAD_SCALE = 256.0  # fp16 headroom for softmax - onehot; divided out in fp32 afterwards
+ENABLED = True  # tests flip this to get the reference path
 
 try:  # the attribute Soup's rewind recorder reads when a step returns no logits
     from soup_cli.utils.stream_loss_chunk import STEP_ATTR
@@ -47,18 +47,28 @@ except Exception:  # noqa: BLE001 - Soup not importable (e.g. a bare unit test)
 
 
 @triton.jit
-def fused_head_ce_kernel(LOGITS, stride_row, TARGET, LOSS, ENTROPY, CORRECT, V,
-                         IGNORE: tl.constexpr, WRITE_GRAD: tl.constexpr,
-                         GRAD_SCALE: tl.constexpr, BLOCK: tl.constexpr):
+def fused_head_ce_kernel(
+    LOGITS,
+    stride_row,
+    TARGET,
+    LOSS,
+    ENTROPY,
+    CORRECT,
+    V,
+    IGNORE: tl.constexpr,
+    WRITE_GRAD: tl.constexpr,
+    GRAD_SCALE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     """One program per token row of the logits buffer."""
     row = tl.program_id(0).to(tl.int64)
     ptr = LOGITS + row * stride_row
     tgt = tl.load(TARGET + row)
 
-    m = float("-inf")   # running max
-    d = 0.0             # running sum exp(z - m)
-    s = 0.0             # running sum exp(z - m) * z, for the entropy
-    zt = 0.0            # logit of the target
+    m = float("-inf")  # running max
+    d = 0.0  # running sum exp(z - m)
+    s = 0.0  # running sum exp(z - m) * z, for the entropy
+    zt = 0.0  # logit of the target
     best = float("-inf")
     arg = 0
     for start in range(0, V, BLOCK):
@@ -81,7 +91,7 @@ def fused_head_ce_kernel(LOGITS, stride_row, TARGET, LOSS, ENTROPY, CORRECT, V,
     lse = m + tl.log(d)
     labelled = tgt != IGNORE
     tl.store(LOSS + row, tl.where(labelled, lse - zt, 0.0))
-    tl.store(ENTROPY + row, lse - s / d)          # = -sum p log p
+    tl.store(ENTROPY + row, lse - s / d)  # = -sum p log p
     tl.store(CORRECT + row, ((arg == tgt) & labelled).to(tl.int32))
 
     if WRITE_GRAD:  # in place: the row's logits become GRAD_SCALE * (softmax - onehot)
@@ -124,29 +134,48 @@ class FusedHeadLoss(torch.autograd.Function):
             tgt = target.reshape(n).to(device=dev, dtype=torch.long)
             lab = tgt != IGNORE_INDEX
             rows_lab = lab.nonzero().squeeze(1)
-            rows_ent = (real.reshape(n).to(dev) & ~lab).nonzero().squeeze(1)  # prompt tokens
+            rows_ent = (
+                (real.reshape(n).to(dev) & ~lab).nonzero().squeeze(1)
+            )  # prompt tokens
 
             token_loss = torch.zeros(n, dtype=torch.float32, device=dev)
             token_entropy = torch.zeros(n, dtype=torch.float32, device=dev)
             correct = torch.zeros((), dtype=torch.long, device=dev)
-            grad = torch.zeros((n, dim), dtype=torch.float32, device=dev) if need_grad else None
+            grad = (
+                torch.zeros((n, dim), dtype=torch.float32, device=dev)
+                if need_grad
+                else None
+            )
 
             rows_max = max(rows_lab.numel(), rows_ent.numel(), 1)
-            buf = torch.empty((min(chunk, rows_max), v), dtype=torch.float16, device=dev)
+            buf = torch.empty(
+                (min(chunk, rows_max), v), dtype=torch.float16, device=dev
+            )
             for rows, write_grad in ((rows_lab, need_grad), (rows_ent, False)):
                 for s0 in range(0, rows.numel(), chunk):
-                    r = rows[s0:s0 + chunk]
+                    r = rows[s0 : s0 + chunk]
                     c = r.numel()
                     logits = buf[:c]
-                    torch.mm(h.index_select(0, r).to(torch.float16), weight16.t(), out=logits)
+                    torch.mm(
+                        h.index_select(0, r).to(torch.float16), weight16.t(), out=logits
+                    )
                     t_c = tgt.index_select(0, r).contiguous()
                     loss_c = torch.empty(c, dtype=torch.float32, device=dev)
                     ent_c = torch.empty(c, dtype=torch.float32, device=dev)
                     cor_c = torch.empty(c, dtype=torch.int32, device=dev)
                     fused_head_ce_kernel[(c,)](
-                        logits, logits.stride(0), t_c, loss_c, ent_c, cor_c, v,
-                        IGNORE=IGNORE_INDEX, WRITE_GRAD=bool(write_grad),
-                        GRAD_SCALE=GRAD_SCALE, BLOCK=BLOCK, num_warps=8,
+                        logits,
+                        logits.stride(0),
+                        t_c,
+                        loss_c,
+                        ent_c,
+                        cor_c,
+                        v,
+                        IGNORE=IGNORE_INDEX,
+                        WRITE_GRAD=bool(write_grad),
+                        GRAD_SCALE=GRAD_SCALE,
+                        BLOCK=BLOCK,
+                        num_warps=8,
                     )
                     token_loss.index_copy_(0, r, loss_c)
                     token_entropy.index_copy_(0, r, ent_c)
@@ -174,26 +203,34 @@ class FusedHeadLoss(torch.autograd.Function):
         return grad_hidden, None, None, None, None, None
 
 
-def fused_head_loss(hidden, weight, labels, attention_mask=None, num_items_in_batch=None,
-                    chunk=CHUNK):
+def fused_head_loss(
+    hidden, weight, labels, attention_mask=None, num_items_in_batch=None, chunk=CHUNK
+):
     """ForCausalLMLoss(fp16 head(hidden), labels) and the metrics, without the full logits."""
     target = torch.nn.functional.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
     target = target.to(hidden.device)
-    if isinstance(attention_mask, torch.Tensor) and attention_mask.shape == target.shape:
+    if (
+        isinstance(attention_mask, torch.Tensor)
+        and attention_mask.shape == target.shape
+    ):
         real = attention_mask.to(hidden.device) != 0
     else:
         real = torch.ones_like(target, dtype=torch.bool)
     labelled = (target != IGNORE_INDEX).sum()
-    if num_items_in_batch is None:  # as fixed_cross_entropy: "mean" over labelled tokens
+    if (
+        num_items_in_batch is None
+    ):  # as fixed_cross_entropy: "mean" over labelled tokens
         denominator = labelled
     elif torch.is_tensor(num_items_in_batch):
         denominator = num_items_in_batch.to(hidden.device)
     else:
         denominator = num_items_in_batch
     loss, entropy, token_loss, correct = FusedHeadLoss.apply(
-        hidden, fp16_weight(weight), target, real, denominator, chunk)
-    return loss, HeadStep(token_entropy=entropy, token_loss=token_loss, correct=correct,
-                          labelled=labelled)
+        hidden, fp16_weight(weight), target, real, denominator, chunk
+    )
+    return loss, HeadStep(
+        token_entropy=entropy, token_loss=token_loss, correct=correct, labelled=labelled
+    )
 
 
 @dataclass(frozen=True)
@@ -201,14 +238,14 @@ class HeadStep:
     """What Soup's rewind recorder and TRL's metrics need from a step without logits."""
 
     token_entropy: Any  # [B, T] fp32, entropy of each position (0 at pads)
-    token_loss: Any     # [B, T] fp32, CE of label t+1 at position t, 0 where unlabelled
-    correct: Any        # labelled positions whose argmax is the label
-    labelled: Any       # labelled positions
+    token_loss: Any  # [B, T] fp32, CE of label t+1 at position t, 0 where unlabelled
+    correct: Any  # labelled positions whose argmax is the label
+    labelled: Any  # labelled positions
 
 
 class _Context:
-    armed = False   # set by the trainer patch around its forward
-    step = None     # HeadStep left by the model patch
+    armed = False  # set by the trainer patch around its forward
+    step = None  # HeadStep left by the model patch
 
 
 _CTX = _Context()
@@ -216,10 +253,15 @@ _CTX = _Context()
 
 def _autocast_fp16() -> bool:
     try:
-        return (torch.is_autocast_enabled("cuda")
-                and torch.get_autocast_dtype("cuda") == torch.float16)
+        return (
+            torch.is_autocast_enabled("cuda")
+            and torch.get_autocast_dtype("cuda") == torch.float16
+        )
     except TypeError:  # older torch
-        return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+        return (
+            torch.is_autocast_enabled()
+            and torch.get_autocast_gpu_dtype() == torch.float16
+        )
 
 
 def _model_can_engage(model, args, kwargs) -> bool:
@@ -228,7 +270,10 @@ def _model_can_engage(model, args, kwargs) -> bool:
     labels = kwargs.get("labels")
     if not isinstance(labels, torch.Tensor) or labels.dim() != 2 or not labels.is_cuda:
         return False
-    if kwargs.get("shift_labels") is not None or kwargs.get("past_key_values") is not None:
+    if (
+        kwargs.get("shift_labels") is not None
+        or kwargs.get("past_key_values") is not None
+    ):
         return False
     if kwargs.get("use_cache") or kwargs.get("return_dict") is False:
         return False
@@ -238,9 +283,16 @@ def _model_can_engage(model, args, kwargs) -> bool:
         return False
     head = getattr(model, "lm_head", None)
     weight = getattr(head, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.dim() != 2 or weight.requires_grad:
+    if (
+        not isinstance(weight, torch.Tensor)
+        or weight.dim() != 2
+        or weight.requires_grad
+    ):
         return False
-    if weight.dtype not in (torch.float16, torch.float32) or getattr(head, "bias", None) is not None:
+    if (
+        weight.dtype not in (torch.float16, torch.float32)
+        or getattr(head, "bias", None) is not None
+    ):
         return False
     if weight.shape[0] != model.config.vocab_size:
         return False
@@ -252,7 +304,7 @@ def _fp16_exact(weight: torch.Tensor, rows: int = 8192) -> bool:
     (checked in row chunks, so no full-size temporary)."""
     with torch.no_grad():
         for start in range(0, weight.shape[0], rows):
-            part = weight[start:start + rows]
+            part = weight[start : start + rows]
             if not torch.equal(part.half().float(), part):
                 return False
     return True
@@ -276,17 +328,27 @@ def compact_tied_embedding(model) -> bool:
     embed = model.get_input_embeddings()
     head = model.get_output_embeddings()
     weight = getattr(embed, "weight", None)
-    if (head is None or weight is None or head.weight is not weight or weight.requires_grad
-            or weight.dtype != torch.float32 or not weight.is_cuda
-            or not isinstance(embed, torch.nn.Embedding)):
+    if (
+        head is None
+        or weight is None
+        or head.weight is not weight
+        or weight.requires_grad
+        or weight.dtype != torch.float32
+        or not weight.is_cuda
+        or not isinstance(embed, torch.nn.Embedding)
+    ):
         return False
     if not _fp16_exact(weight):
-        print("[solution.head] tied embedding is not fp16-exact: kept in fp32", flush=True)
+        print(
+            "[solution.head] tied embedding is not fp16-exact: kept in fp32", flush=True
+        )
         return False
     _W16.clear()  # the separate fp16 copy of the head goes away with this
     weight.data = weight.data.to(torch.float16)
     embed.register_forward_hook(_upcast_output)
-    print("[solution.head] tied embedding stored in fp16 (values unchanged)", flush=True)
+    print(
+        "[solution.head] tied embedding stored in fp16 (values unchanged)", flush=True
+    )
     return True
 
 
@@ -310,14 +372,21 @@ def patch_qwen2_fused_head():
         # Qwen2ForCausalLM.forward of transformers 5.16.1 up to the head; loss kwargs such as
         # num_items_in_batch go to the decoder as they do there.
         outputs = self.model(**kwargs)
-        loss, step = fused_head_loss(outputs.last_hidden_state, self.lm_head.weight, labels,
-                                     attention_mask=kwargs.get("attention_mask"),
-                                     num_items_in_batch=kwargs.get("num_items_in_batch"))
+        loss, step = fused_head_loss(
+            outputs.last_hidden_state,
+            self.lm_head.weight,
+            labels,
+            attention_mask=kwargs.get("attention_mask"),
+            num_items_in_batch=kwargs.get("num_items_in_batch"),
+        )
         _CTX.step = step
-        return CausalLMOutputWithPast(loss=loss, logits=None,
-                                      past_key_values=outputs.past_key_values,
-                                      hidden_states=outputs.hidden_states,
-                                      attentions=outputs.attentions)
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=None,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     cls.forward = forward
     cls._soup_fused_head = True
@@ -326,16 +395,24 @@ def patch_qwen2_fused_head():
 def _trainer_can_engage(trainer, inputs) -> bool:
     if not ENABLED or not getattr(getattr(trainer, "model", None), "training", False):
         return False  # training steps only; eval / predict keep TRL's path
-    if "labels" not in inputs or "shift_labels" in inputs or "attention_mask" not in inputs:
+    if (
+        "labels" not in inputs
+        or "shift_labels" in inputs
+        or "attention_mask" not in inputs
+    ):
         return False
     args = getattr(trainer, "args", None)
     if getattr(args, "use_liger_kernel", False) or getattr(args, "padding_free", False):
         return False
-    if getattr(trainer, "num_virtual_tokens", 0) or getattr(trainer, "aux_loss_enabled", False):
+    if getattr(trainer, "num_virtual_tokens", 0) or getattr(
+        trainer, "aux_loss_enabled", False
+    ):
         return False
     if getattr(trainer, "compute_loss_func", None) is not None:
         return False
-    return getattr(trainer, "label_smoother", None) is None and hasattr(trainer, "_metrics")
+    return getattr(trainer, "label_smoother", None) is None and hasattr(
+        trainer, "_metrics"
+    )
 
 
 def log_step_metrics(trainer, mode, inputs, step: HeadStep) -> None:
@@ -343,9 +420,13 @@ def log_step_metrics(trainer, mode, inputs, step: HeadStep) -> None:
     acc = trainer.accelerator
     attention_mask = inputs["attention_mask"]
     entropy = torch.sum(step.token_entropy * attention_mask) / attention_mask.sum()
-    trainer._metrics[mode]["entropy"].append(acc.gather_for_metrics(entropy).mean().item())
+    trainer._metrics[mode]["entropy"].append(
+        acc.gather_for_metrics(entropy).mean().item()
+    )
     if mode == "train":
-        trainer._total_train_tokens += acc.gather_for_metrics(attention_mask.sum()).sum().item()
+        trainer._total_train_tokens += (
+            acc.gather_for_metrics(attention_mask.sum()).sum().item()
+        )
     trainer._metrics[mode]["num_tokens"] = [trainer._total_train_tokens]
     correct = acc.gather_for_metrics(step.correct)
     total = acc.gather_for_metrics(step.labelled)
@@ -363,9 +444,12 @@ def log_logit_metrics(trainer, mode, inputs, labels, logits) -> None:
         target = torch.nn.functional.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
         per_token = entropy_from_logits(logits)
         labelled = target != IGNORE_INDEX
-        step = HeadStep(token_entropy=per_token, token_loss=None,
-                        correct=((logits.argmax(-1) == target) & labelled).sum(),
-                        labelled=labelled.sum())
+        step = HeadStep(
+            token_entropy=per_token,
+            token_loss=None,
+            correct=((logits.argmax(-1) == target) & labelled).sum(),
+            labelled=labelled.sum(),
+        )
         log_step_metrics(trainer, mode, inputs, step)
 
 
@@ -378,25 +462,38 @@ def patch_sft_compute_loss():
     original = cls.compute_loss
 
     @functools.wraps(original)
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         from . import warmup
 
         warmup.wait()  # kernels compiled during model loading (no-op after the first step)
         if not _trainer_can_engage(self, inputs):
-            return original(self, model, inputs, return_outputs=return_outputs,
-                            num_items_in_batch=num_items_in_batch)
+            return original(
+                self,
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
         mode = "train" if self.model.training else "eval"
-        inputs.pop("_prediction_loss_only", None)   # as TRL does before it delegates
+        inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates
         inputs["use_cache"] = False
         labels = inputs["labels"]
         _CTX.armed, _CTX.step = True, None
         try:
             loss, outputs = super(cls, self).compute_loss(
-                model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
         finally:
             _CTX.armed = False
         step, _CTX.step = _CTX.step, None
-        setattr(self, STEP_ATTR, step)  # rewind reads step.token_loss when logits are None
+        setattr(
+            self, STEP_ATTR, step
+        )  # rewind reads step.token_loss when logits are None
         if step is not None:
             log_step_metrics(self, mode, inputs, step)
         else:

@@ -31,7 +31,7 @@ import functools
 
 import torch
 
-from . import unpad
+from . import offload, unpad
 
 ENABLED = True
 # Recompute each packed layer in backward instead of keeping its activations: only the layer
@@ -285,6 +285,12 @@ def patch_qwen2_packed_layers():
             residual = h
             x = self.post_attention_layernorm(h)
             return residual + self.mlp(x)
+
+        store = offload.active_store()
+        if store is not None and torch.is_grad_enabled() and id(self) in store.index:
+            return store.run_layer(
+                self, body, hidden_states
+            )  # streamed weights, recomputed
 
         if CHECKPOINT_LAYERS and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint
