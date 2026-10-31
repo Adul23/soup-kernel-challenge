@@ -36,6 +36,71 @@ ENABLED = True
 # (torch.utils.checkpoint, non-reentrant, RNG preserved so LoRA dropout replays the same masks);
 # Soup's gradient_checkpointing switch stays off. Costs a second forward of every layer.
 CHECKPOINT_LAYERS = True
+# Attention on the packed tokens themselves: PyTorch's memory-efficient attention kernel (the one
+# SDPA already runs on the T4) called with cu_seqlens, causal within each row. No scatter to the
+# padded batch, and no work on padded queries or keys. Falls back to padded SDPA (with a warning)
+# if the op is unavailable.
+VARLEN = True
+_VARLEN_STATE = {"ok": True, "calls": 0}
+
+
+class VarlenAttention(torch.autograd.Function):
+    """Causal attention over B sequences packed back to back: q/k/v [n, heads, d] fp16."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_len, scale):
+        out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            None,
+            cu_seqlens,
+            cu_seqlens,
+            max_len,
+            max_len,
+            0.0,
+            1,
+            True,
+            scale=scale,
+        )  # 1 = causal from the top left
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens, seed, offset)
+        ctx.max_len, ctx.scale = max_len, scale
+        return out.squeeze(0)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, out, lse, cu_seqlens, seed, offset = ctx.saved_tensors
+        gq, gk, gv, _ = torch.ops.aten._efficient_attention_backward(
+            grad_out.unsqueeze(0).contiguous(),
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            None,
+            out,
+            cu_seqlens,
+            cu_seqlens,
+            ctx.max_len,
+            ctx.max_len,
+            lse,
+            0.0,
+            seed,
+            offset,
+            1,
+            False,
+            scale=ctx.scale,
+        )
+        return gq.squeeze(0), gk.squeeze(0), gv.squeeze(0), None, None, None
+
+
+def _varlen_ok(attn, st):
+    if (
+        not (VARLEN and _VARLEN_STATE["ok"])
+        or attn.config._attn_implementation != "sdpa"
+    ):
+        return None
+    if attn.training and attn.attention_dropout:
+        return None
+    return st.varlen()
 
 
 def _lora_parts(layer):
@@ -105,6 +170,38 @@ def _attention(attn, x, attention_mask, position_embeddings, st, kwargs):
     cos, sin = st.rope(*position_embeddings)
     # Base: q [B, heads, T, d] with cos [B, 1, T, d]; here q [n, heads, d] with cos [n, 1, d].
     q, k = mq.apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+    varlen = _varlen_ok(attn, st)
+    if varlen is not None:
+        cu_seqlens, max_len = varlen
+        heads, groups = q.shape[1], attn.num_key_value_groups
+
+        def heads16(
+            t,
+        ):  # fp16 as SDPA's autocast makes it; kv heads repeated as repeat_kv does
+            t = t.view(n, -1, d).to(torch.float16)
+            if t.shape[1] != heads:
+                t = (
+                    t[:, :, None, :]
+                    .expand(n, t.shape[1], groups, d)
+                    .reshape(n, heads, d)
+                )
+            return t.contiguous()
+
+        try:
+            out = VarlenAttention.apply(
+                heads16(q), heads16(k), heads16(v), cu_seqlens, max_len, attn.scaling
+            )
+            _VARLEN_STATE["calls"] += 1
+            return attn.o_proj(out.reshape(n, -1))
+        except Exception as exc:  # noqa: BLE001 - e.g. the op is missing in this torch build
+            import warnings
+
+            _VARLEN_STATE["ok"] = False
+            warnings.warn(
+                f"solution.packed: varlen attention unavailable, padded SDPA ({exc!r})",
+                stacklevel=2,
+            )
 
     def padded(t):  # [n, heads * d] -> [B, heads, T, d], zeros at the pads
         return st.scatter(t.reshape(n, -1)).view(st.b, st.t, -1, d).transpose(1, 2)

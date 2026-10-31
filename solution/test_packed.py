@@ -50,11 +50,14 @@ def _model():
     return model.train()
 
 
+@pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("checkpoint_layers", [False, True])
-def test_packed_layers_match_padded_and_keep_rng(checkpoint_layers):
+def test_packed_layers_match_padded_and_keep_rng(checkpoint_layers, varlen):
     from solution import packed, unpad
 
     packed.CHECKPOINT_LAYERS = checkpoint_layers
+    packed.VARLEN = varlen
+    packed._VARLEN_STATE.update(ok=True, calls=0)
 
     unpad.patch_qwen2_unpad()
     packed.patch_qwen2_packed_layers()
@@ -95,6 +98,10 @@ def test_packed_layers_match_padded_and_keep_rng(checkpoint_layers):
     finally:
         hook.remove()
         packed.CHECKPOINT_LAYERS = True
+        packed.VARLEN = True
+
+    if varlen:  # it must really have run, not fallen back to padded SDPA
+        assert packed._VARLEN_STATE["ok"] and packed._VARLEN_STATE["calls"] > 0
 
     # (a recompute calls the layer body directly, not through the module, so no second call here)
     assert seen == [2], (
