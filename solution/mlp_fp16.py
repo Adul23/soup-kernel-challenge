@@ -33,11 +33,38 @@ def _is_fp16_linear4bit(module) -> bool:
             and module.compute_dtype == torch.float16)
 
 
+def _applies(mlp, x) -> bool:
+    return (ENABLED and x.is_cuda and x.dtype == torch.float32
+            and getattr(mlp.config, "hidden_act", "silu") == "silu"
+            and _is_fp16_linear4bit(mlp.gate_proj) and _is_fp16_linear4bit(mlp.up_proj)
+            and _is_fp16_linear4bit(mlp.down_proj))
+
+
+def _act(mlp, x):
+    """The fp16 input of down_proj: SwiGLU of gate and up."""
+    from .swiglu import swiglu
+
+    xa = x.to(torch.float16)  # two casts on purpose: see the module docstring
+    xb = x.to(torch.float16)
+    return swiglu(mlp.gate_proj(xa), mlp.up_proj(xb))
+
+
+def mlp_act(mlp, x):
+    """down_proj's fp16 input for a packed [n, hidden] x, or None when Qwen2MLP.forward would not
+    compute `down_proj(_act(mlp, x))` here (offload.py then runs the whole MLP)."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    cls = modeling_qwen2.Qwen2MLP
+    if type(mlp) is not cls or not getattr(cls, "_soup_mlp_fp16", False):
+        return None
+    if x.dim() != 2 or mlp._forward_hooks or mlp._forward_pre_hooks or not _applies(mlp, x):
+        return None  # (unpad.py hands a 2-D input straight to our forward)
+    return _act(mlp, x)
+
+
 def patch_qwen2_mlp_fp16():
     """Wraps the installed Qwen2MLP.forward; install before patch_qwen2_unpad()."""
     from transformers.models.qwen2 import modeling_qwen2
-
-    from .swiglu import swiglu
 
     cls = modeling_qwen2.Qwen2MLP
     if getattr(cls, "_soup_mlp_fp16", False):
@@ -46,14 +73,9 @@ def patch_qwen2_mlp_fp16():
 
     @functools.wraps(original)
     def forward(self, x):
-        if not (ENABLED and x.is_cuda and x.dtype == torch.float32
-                and getattr(self.config, "hidden_act", "silu") == "silu"
-                and _is_fp16_linear4bit(self.gate_proj) and _is_fp16_linear4bit(self.up_proj)
-                and _is_fp16_linear4bit(self.down_proj)):
+        if not _applies(self, x):
             return original(self, x)
-        xa = x.to(torch.float16)  # two casts on purpose: see the module docstring
-        xb = x.to(torch.float16)
-        return self.down_proj(swiglu(self.gate_proj(xa), self.up_proj(xb)))
+        return self.down_proj(_act(self, x))
 
     cls.forward = forward
     cls._soup_mlp_fp16 = True

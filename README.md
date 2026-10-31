@@ -181,6 +181,14 @@ go into the same online statistics.
   per layer and restored for the recompute, so LoRA dropout draws the same masks, and the global
   RNG ends where base Soup leaves it (`test_offload.py` compares RNG states, loss and gradients
   against the plain run). Autocast is re-entered with the forward's settings.
+- **The recompute stops before `down_proj`.** Its forward matmul only fed the layer output,
+  whose gradient backward already has. The layer output is `residual + down_proj(act)`, and
+  `act` (the fp16 SwiGLU output) feeds nothing else, so we seed `residual` with the output
+  gradient and `act` with `grad.to(fp16) @ dequant(W_down)`: the cast the add's backward does
+  and the matmul `NF4Linear.backward` does, on the same shapes. The gradients are bit-identical
+  to the full recompute (`test_offload.py`, `torch.equal`), with one dequantization and about
+  29% of the recompute's GEMM work less per layer. `SKIP_DOWN_RECOMPUTE = False` restores the
+  full recompute.
 - **The tied embedding / head matrix (467 MB in fp16) lives in pinned host RAM.** It is loaded
   there directly (the device transformers picks for `embed_tokens.weight`), and kept in fp16:
   `prepare_model_for_kbit_training` would widen it to fp32, so we hide it from that cast and widen
@@ -189,13 +197,18 @@ go into the same online statistics.
   embedding rows of a batch are gathered on the CPU and copied over.
 - **The fused head streams the vocabulary (`head_stream.py`).** The vocabulary becomes the outer
   loop: 4,096-row pieces of the weight come to the GPU through two slots (the next piece copied
-  while the current one is used), and each piece is used for all token rows at once. Pass 1:
-  cuBLAS logits of the piece, then `head_chunk_stats_kernel` carries each row's online max /
-  sum-exp / entropy sum / first-index argmax / target logit across pieces in fp32. The piece size
-  is a multiple of the 4,096-wide block, so the blocks are visited in the same order with the same
-  arithmetic as `fused_head_ce_kernel`. Pass 2 (labelled rows): logits again,
-  `head_chunk_grad_kernel` turns them in place into `256 * (softmax − onehot)`, and cuBLAS
-  multiplies them by the piece; the fp16 products are summed in fp32. `test_head_stream.py`
+  while the current one is used), and each piece is used for all token rows at once, in one
+  pass over the vocabulary. For each piece cuBLAS computes the logits, and
+  `head_chunk_stats_kernel` carries each row's online max / sum-exp / entropy sum / first-index
+  argmax / target logit across pieces in fp32. The piece size is a multiple of the 4,096-wide
+  block, so the blocks are visited in the same order with the same arithmetic as
+  `fused_head_ce_kernel`. For labelled rows the same kernel overwrites the piece's logits with
+  `256 * exp(z − m) / d`, normalised by the running max `m` and sum-exp `d`, and cuBLAS
+  accumulates `acc = acc * exp(m_prev − m) * d_prev / d + P @ W_piece` in fp32, as flash
+  attention accumulates its output. At the end `acc = 256 * softmax @ W`, and the gradient is
+  `acc − 256 * W[target]`. A row of `P` sums to at most 256, so the fp16 products cannot
+  overflow. The weight crosses PCIe once per step and the logits are computed once.
+  `test_head_stream.py`
   compares loss, entropy, per-token loss, accuracy and the hidden-state gradient with the
   GPU-resident head.
 

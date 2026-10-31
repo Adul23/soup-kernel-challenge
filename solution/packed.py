@@ -31,7 +31,7 @@ import functools
 
 import torch
 
-from . import offload, unpad
+from . import mlp_fp16, offload, unpad
 
 ENABLED = True
 # Recompute each packed layer in backward instead of keeping its activations: only the layer
@@ -274,9 +274,10 @@ def patch_qwen2_packed_layers():
             hidden_states = st.gather(hidden_states)
         attn_kwargs = dict(position_ids=position_ids, use_cache=use_cache, **kwargs)
 
-        def body(
-            h,
-        ):  # everything it needs is captured here, so a recompute does not need unpad
+        def body(h, split=False):
+            # Everything it needs is captured here, so a recompute does not need unpad.
+            # split=True (offload.py's recompute): stop before down_proj and return
+            # (residual, down_proj input, down_proj) when the MLP is ours; see offload.py.
             residual = h
             x = self.input_layernorm(h)
             h = residual + _attention(
@@ -284,6 +285,10 @@ def patch_qwen2_packed_layers():
             )
             residual = h
             x = self.post_attention_layernorm(h)
+            if split:
+                act = mlp_fp16.mlp_act(self.mlp, x)
+                if act is not None:
+                    return residual, act, self.mlp.down_proj
             return residual + self.mlp(x)
 
         store = offload.active_store()

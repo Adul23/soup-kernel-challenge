@@ -163,3 +163,50 @@ def test_streamed_absmax_bit_identical():
                 assert nf4._ABSMAX.get(id(qs), (None,))[0] is not qs
     finally:
         offload._STORE["store"] = None
+
+
+def test_skip_down_recompute_is_bit_identical():
+    """Stopping the recompute before down_proj and seeding its input gradient directly gives
+    exactly the gradients of the full recompute."""
+    from solution import mlp_fp16, nf4, offload, packed, unpad
+
+    mlp_fp16.patch_qwen2_mlp_fp16()
+    unpad.patch_qwen2_unpad()
+    packed.patch_qwen2_packed_layers()
+    nf4.patch_bnb_matmul_4bit()
+    offload.patch_matmul_4bit()
+
+    ids = torch.randint(0, 1000, (4, 40), device="cuda")
+    mask = torch.ones_like(ids)
+    for row, n in enumerate([40, 23, 9, 31]):
+        mask[row, n:] = 0
+    labels = ids.masked_fill(mask == 0, -100)
+
+    def run(skip):
+        offload.SKIP_DOWN_RECOMPUTE = skip
+        offload._STORE["store"] = None
+        model = _model()
+        assert offload.build_store(model) is not None
+        calls = offload._SPLIT_STATE["calls"]
+        try:
+            torch.manual_seed(1234)
+            with torch.autocast("cuda", dtype=torch.float16):
+                out = model(
+                    input_ids=ids, attention_mask=mask, labels=labels, use_cache=False
+                )
+            out.loss.backward()
+        finally:
+            offload._STORE["store"] = None
+            offload.SKIP_DOWN_RECOMPUTE = True
+        grads = {
+            n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None
+        }
+        return out.loss.detach(), grads, offload._SPLIT_STATE["calls"] - calls
+
+    loss_ref, grads_ref, split_ref = run(False)
+    loss, grads, split = run(True)
+    assert split_ref == 0 and split == 3  # every layer of the 3-layer model took the split
+    assert torch.equal(loss, loss_ref)
+    assert grads.keys() == grads_ref.keys() and grads
+    for name, g in grads_ref.items():
+        assert torch.equal(grads[name], g), name

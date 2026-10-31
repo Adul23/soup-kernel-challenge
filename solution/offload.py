@@ -51,6 +51,12 @@ STREAM_ABSMAX = (
     True  # the fp32 absmax travels with the bytes instead of an 82 MB GPU cache
 )
 QUANT_STATE_HOST = True  # bitsandbytes' 8-bit absmax (~20 MB) to host RAM once streamed
+# In the recompute, stop each layer before down_proj: its forward matmul (and a dequant) only
+# fed the layer output, whose gradient we already have; the gradient of down_proj's input is
+# computed directly, the same matmul NF4Linear.backward does. Same numbers, ~29% fewer recompute
+# GEMM flops. False: recompute the whole layer.
+SKIP_DOWN_RECOMPUTE = True
+_SPLIT_STATE = {"calls": 0}
 ARENA_ROWS = 2048  # tokens per pinned input buffer (batch 4 x max_length 512)
 _STORE = {"store": None}
 
@@ -272,6 +278,27 @@ class LayerStore:
             flush=True,
         )
 
+    def down_input_grad(self, down, act, grad_out):
+        """d(residual + down(act))/d(act) seeded with grad_out, computed as autograd and
+        NF4Linear.backward compute it: the fp32 grad rounded to act's fp16 by the add's
+        backward, times the dequantized weight (one matmul, same shapes). None when down(act)
+        would not take that path; the caller then runs down_proj as usual."""
+        if hasattr(down, "lora_A") or getattr(down, "bias", None) is not None:
+            return None
+        if down._forward_hooks or down._forward_pre_hooks or down._backward_hooks:
+            return None
+        w = getattr(down, "weight", None)
+        qs = getattr(w, "quant_state", None)
+        if qs is None or type(w).__name__ != "Params4bit":
+            return None
+        gpu = w if w.is_cuda else self.gpu_weight(w)
+        if gpu is None or not nf4._usable(act, gpu, qs, None, None):
+            return None
+        if grad_out.shape != (act.shape[0], qs.shape[0]) or grad_out.dtype != torch.float32:
+            return None
+        g16 = grad_out.to(act.dtype)
+        return torch.matmul(g16, nf4.dequantize_nf4(gpu, qs, g16.dtype))
+
     def run_layer(self, layer, body, h):
         self.check_once()
         params = tuple(p for p in layer.parameters() if p.requires_grad)
@@ -311,9 +338,23 @@ class _StreamedLayer(torch.autograd.Function):
                 torch.enable_grad(),
                 torch.autocast("cuda", dtype=ac_dtype, enabled=ac_on),
             ):
-                out = body(h)
+                out = body(h, split=SKIP_DOWN_RECOMPUTE)
+                g_act = None
+                if isinstance(out, tuple):  # stopped before down_proj (packed.py)
+                    residual, act, down = out
+                    if residual.requires_grad and act.requires_grad:
+                        g_act = store.down_input_grad(down, act, grad_out)
+                    if g_act is None:
+                        out = residual + down(act)  # what the full body returns
         inputs = ((h,) if need_h else ()) + ctx.params
-        grads = torch.autograd.grad(out, inputs, grad_out, allow_unused=True)
+        if g_act is not None:
+            # out = residual + down(act), and act feeds nothing else: seed both directly.
+            _SPLIT_STATE["calls"] += 1
+            grads = torch.autograd.grad(
+                (residual, act), inputs, (grad_out, g_act), allow_unused=True
+            )
+        else:
+            grads = torch.autograd.grad(out, inputs, grad_out, allow_unused=True)
         store.release(i)
         if need_h:
             return (grads[0], None) + tuple(grads[1:])
