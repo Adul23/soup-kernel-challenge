@@ -1,27 +1,36 @@
-# Soup Kernel Challenge: 1.45–1.67x faster, 3.08x less GPU memory on a T4
+# Soup Kernel Challenge: 21x less GPU memory (676 MiB), 1.24x faster on a T4
 
-Our solution makes `soup train` (Soup 0.77.0, Qwen2.5-1.5B-Instruct, NF4 + LoRA, 64 steps on a
-Kaggle T4) **1.45–1.67x faster** and cuts its peak GPU memory **from 14,345 MiB to 4,657 MiB
-(3.08x)**. Eval loss stays the same (−0.000%), and all 10 checks of `harness/check_rules.py` pass.
-Four `@triton.jit` kernels of our own take 10.1% of the training time. Everything lives in
-`solution/` and is installed by `solution.apply()`.
+Our solution runs `soup train` (Soup 0.77.0, Qwen2.5-1.5B-Instruct, NF4 + LoRA, 64 steps on a
+Kaggle T4) with a peak GPU memory of **676 MiB instead of 14,468 MiB (21.4x less)** and
+**1.24x faster** (71.6 s instead of 88.9 s). Eval loss stays the same (−0.001%), and all 10
+checks of `harness/check_rules.py` pass. Six `@triton.jit` kernels of our own take 9.2% of the
+training time. Everything lives in `solution/` and is installed by `solution.apply()`.
 
-The speed ratio depends on how fast base Soup happens to run in the session. In the run below
-base Soup took 90.4 s, which gave 1.67x. In our other sessions it took 77–80 s; against that, our
-54 s would be about 1.45x (an estimate, not a measured run of this commit). The training loop
-alone is steadier: 1.83x. An optional switch trades speed for
-memory: **2,277 MiB (6.3x less)** at about 1.19x (see Limits).
+How: the frozen model lives in pinned host RAM. The NF4 weights stream to the GPU one decoder
+layer at a time over PCIe while the previous layer computes; every layer is recomputed in
+backward, and its input waits in host RAM; the 151,936 x 1,536 tied embedding / head matrix
+streams in 4,096-row pieces through our fused head. The GPU holds the CUDA context, the LoRA
+adapter and its optimizer state, two layer slots, two head slots and one layer's activations.
 
 **Public Kaggle notebook (the measured run):** https://www.kaggle.com/code/djparty/soupv4  
 **Final commit:** https://github.com/BAITC-Hacks/hack-1d8bdb00-justdoner/commit/<FINAL_SHA>
 
 | Kaggle T4, `harness/run_task.py` | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Wall time of `soup train`, s | 90.42 | 54.06 | **1.673x faster** |
-| Training loop (64 steps), s | 56.01 | 30.57 | 1.83x |
-| Peak GPU memory (nvidia-smi), MiB | 14,345 | 4,657 | **3.080x less** |
-| Eval loss, public rows | 2.04965 | 2.04964 | −0.000% |
+| Wall time of `soup train`, s | 88.93 | 71.64 | **1.241x faster** |
+| Training loop (64 steps), s | — | 51.54 | |
+| Peak GPU memory (nvidia-smi), MiB | 14,468 | 676 | **21.4x less** |
+| Peak memory allocated by PyTorch, MiB | — | 392 | |
+| Eval loss, public rows | 2.04968 | 2.04966 | −0.001% |
 | Loss curve vs base (check 6) | | first step 0.02%, mean 0.01% | limits 1% / 3% |
+
+The nvidia-smi peak is the sum over all GPUs and includes any CUDA context another process
+(e.g. the notebook kernel itself) holds when the run starts; in that run base Soup peaked at
+14,468 MiB instead of its usual 14,345, so about 120 MiB of both peaks were not ours. Base
+Soup's wall time also varies between Kaggle sessions (75–92 s).
+
+We also keep the faster, larger variant in the history: without the offload (section 8) the same
+code runs in 45.9 s (1.63x against a 75 s base) at 4,655 MiB (3.08x).
 
 ## What we did
 
@@ -41,8 +50,8 @@ same size. TRL reads the logits again for entropy and token accuracy, and Soup's
 recorder reads them a third time for per-row losses. At the peak that is several GB.
 
 Our version:
-- **Chunked logits.** cuBLAS computes the logits for 512 tokens at a time into one reused fp16
-  buffer. The fp16 inputs, fp32 accumulation and fp16 output are what autocast does.
+- **Chunked logits.** cuBLAS computes the logits for 128 tokens at a time into one reused fp16
+  buffer (with the offload, the vocabulary is chunked instead: section 8). The fp16 inputs, fp32 accumulation and fp16 output are what autocast does.
 - **One kernel pass per row.** Our kernel reads each row once and computes in fp32 an online
   max / sum-exp (log-sum-exp), the entropy, the first-index argmax and the target logit.
 - **Gradient in place.** For labelled rows, a second pass writes `softmax - onehot` back into
@@ -57,7 +66,8 @@ Our version:
   / head weight to fp32 (0.93 GB). We check, in row chunks, that every value is an fp16 value
   (the model is loaded in fp16), and then store it once in fp16. The head uses it directly, and
   a forward hook widens the embedding output back to fp32. The stream keeps its dtype and every
-  value. If any value is not fp16-exact, the weight is left as it is.
+  value. If any value is not fp16-exact, the weight is left as it is. With the offload (section 8)
+  the weight is never widened in the first place.
 
 ### 2. NF4 weight dequantization (`nf4.py`, kernel `nf4_dequant_kernel`)
 
@@ -70,11 +80,9 @@ Our version:
 - **Our kernel writes the fp16 weight straight from the packed bytes.** It uses the arithmetic
   of bitsandbytes' `csrc/kernels.cu`: `LUT[byte >> 4] * absmax` and `LUT[byte & 15] * absmax`,
   one fp32 multiply each, rounded to fp16 on store.
-- **The absmax of each frozen weight is rebuilt once**, by bitsandbytes itself, and kept
-  (about 82 MB in fp32). With the NF4 weights streamed from host RAM (`offload.py`) it is kept
-  in each layer's pinned buffer, right after the layer's NF4 bytes, and reaches the GPU slot in
-  the same copy; without streaming it is cached on the GPU.
-- **Launch arguments are cached per weight** (flat packed view, LUT, size, grid): the
+- **The absmax of each frozen weight is rebuilt once**, by bitsandbytes itself, and cached
+  (about 80 MB).
+- **Launch arguments are cached per weight** (flat packed view, absmax, LUT, size, grid): the
   hook runs 389 times a step, so the per-call Python work is a dict lookup plus a storage check
   (`data_ptr`, size, dtype, device), since Linear4bit passes a fresh `.t()` view each call. The
   launch itself still goes through `nf4_dequant_kernel[grid](...)`.
@@ -151,63 +159,75 @@ between runs, and behave the same under measurement and tests. They do not count
   everything downstream are identical; Soup's rewind fingerprint hashes the rows themselves.
   `test_startup.py` checks the rows, the random states and that no hashing happened.
 
-### 8. Frozen weights in host RAM, every layer recomputed (`offload.py`, `head_stream.py`)
+### 8. Low GPU memory: the frozen model in host RAM (`offload.py`, `head_stream.py`)
 
-This is what takes the peak from 4,657 MiB to about 550 MiB. Everything frozen lives in pinned
-host RAM and crosses PCIe while the GPU computes; the GPU keeps only the LoRA adapters, their
-optimizer state, two weight slots and the activations of the layer that is running. All of it
-is our own code (offloading and recomputation in `solution/`, as the organizers allowed); Soup's
-`gradient_checkpointing`, layer streaming and other switches stay off.
+Sections 1–7 make each step cheaper; this section moves what does not have to be on the GPU off
+it. It is our own code (Soup's `gradient_checkpointing` and layer-streaming switches stay off), and
+it changes no value: the same bytes are dequantized by the same kernel, and the same fp16 logits
+go into the same online statistics.
 
-- **NF4 weights stream one layer at a time.** Right after bitsandbytes quantizes a weight on
-  the GPU during loading, its packed bytes move to host RAM (`Params4bit._quantize` hook), so
-  they never pile up on the GPU. When the model is ready, each decoder layer's bytes go into one
-  pinned buffer (703 MiB for 28 layers). Two GPU slots hold two layers: while layer *i*
-  computes, layer *i+1* (forward) or *i−1* (backward) is copied in on a side stream. CUDA
-  events order each copy after the last kernel that read the slot, and the compute stream waits
-  for the copy. The bytes are the same, and `nf4_dequant_kernel` dequantizes them as before.
-- **The fp32 absmax streams with its layer.** It is rebuilt once per weight by bitsandbytes,
-  as before, and stored after the layer's NF4 bytes in the same pinned buffer, so the same copy
-  brings it into the slot (about 82 MB that no longer stay on the GPU). `test_offload.py`
-  checks with `torch.equal` that every weight dequantizes exactly as bitsandbytes does, from
-  the slot and outside it.
-- **Every layer is recomputed in backward** by our own autograd Function. Only the layer input
-  `[n_real, 1536]` is kept, and it is copied to a pinned buffer per layer on a side stream and
-  brought back for that layer's backward. The CUDA RNG state is saved per layer and restored
-  for the recompute, so LoRA dropout draws the same masks, and the RNG stream ends where base
-  Soup leaves it (`test_offload.py` compares RNG states, loss and gradients). Autocast is
-  re-entered with the forward's settings.
-- **The tied fp16 embedding / head matrix (467 MB) is loaded straight into pinned host RAM**
-  (the device transformers picks for that one tensor). The embedding rows of a batch are
-  gathered on the CPU and copied over; an fp16 value widened to fp32 is exact, so the residual
-  stream sees the same numbers. The fused head (`head_stream.py`) puts the vocabulary in the
-  outer loop: 8,192-row pieces come in through two GPU slots, and each piece is used for all
-  token rows. Pass 1 computes the logits of a piece with cuBLAS, and `head_chunk_stats_kernel`
-  carries each row's online max, sum-exp, entropy sum, first-index argmax and target logit
-  across the pieces, visiting the blocks in the same order with the same arithmetic as
-  `fused_head_ce_kernel`. Pass 2 recomputes the logits, `head_chunk_grad_kernel` turns them in
-  place into `256 · (softmax − onehot)`, and cuBLAS multiplies them by the piece; the pieces'
-  products are summed in fp32. So the matrix crosses PCIe twice per step instead of living on
-  the GPU (`test_head_stream.py`).
-- **Loading:** transformers' `caching_allocator_warmup` reserves the whole model's size on the
-  GPU before loading (a load-speed trick). With the weights going to host RAM that block would
-  be the peak of the run, so we skip it; no value changes. peft's
-  `prepare_model_for_kbit_training` would widen the frozen tied embedding to fp32; we keep it in
-  fp16 (allowed by the organizers when exact) and widen the embedding output with a forward
-  hook. `PreTrainedModel.device` skips our host-RAM parameters, and the new LoRA adapters are
-  moved to the GPU before the optimizer is built.
-- **Cost:** the recompute is a second forward of every layer, and the head computes its logits
-  twice. The training loop takes about 51.5 s instead of 30.6 s. By the scoring formula the
-  memory gain outweighs that.
+- **NF4 weights stream layer by layer (625 MiB in host RAM).** Right after bitsandbytes quantizes
+  a weight on the GPU during loading, its packed bytes move to host RAM (`Params4bit._quantize`
+  hook), so they never pile up on the GPU. Once the model is ready they are copied into one
+  pinned buffer per decoder layer. Two GPU slots hold two layers: while layer i computes, layer
+  i+1 (forward) or i−1 (backward) is copied in on a side CUDA stream (~23 MB per layer; PCIe
+  measured at 11.7 GB/s on the Kaggle T4, against 2–4 ms of compute per layer). CUDA events order
+  each copy after the last kernel that read the slot, and the compute stream waits for the copy.
+  The quantization state (absmax) moves to host RAM too: the fp32 absmax our kernel reads (82 MB as a GPU cache) is copied with each layer's bytes into its slot, so bitsandbytes' 8-bit absmax is no longer read on the GPU.
+- **Every layer is recomputed in backward, and its input waits in host RAM.** Our own autograd
+  Function (`_StreamedLayer`) runs the packed layer without autograd in forward, copies its input
+  `[n_real, 1536]` to a pinned buffer on another side stream, and in backward copies it back,
+  recomputes the layer with autograd and backpropagates through it. The CUDA RNG state is saved
+  per layer and restored for the recompute, so LoRA dropout draws the same masks, and the global
+  RNG ends where base Soup leaves it (`test_offload.py` compares RNG states, loss and gradients
+  against the plain run). Autocast is re-entered with the forward's settings.
+- **The tied embedding / head matrix (467 MB in fp16) lives in pinned host RAM.** It is loaded
+  there directly (the device transformers picks for `embed_tokens.weight`), and kept in fp16:
+  `prepare_model_for_kbit_training` would widen it to fp32, so we hide it from that cast and widen
+  the embedding output instead (an fp16 value widened is exact, so the residual stream sees the
+  same fp32 numbers; the organizers allowed fp16 storage of the frozen tied embedding). The
+  embedding rows of a batch are gathered on the CPU and copied over.
+- **The fused head streams the vocabulary (`head_stream.py`).** The vocabulary becomes the outer
+  loop: 4,096-row pieces of the weight come to the GPU through two slots (the next piece copied
+  while the current one is used), and each piece is used for all token rows at once. Pass 1:
+  cuBLAS logits of the piece, then `head_chunk_stats_kernel` carries each row's online max /
+  sum-exp / entropy sum / first-index argmax / target logit across pieces in fp32. The piece size
+  is a multiple of the 4,096-wide block, so the blocks are visited in the same order with the same
+  arithmetic as `fused_head_ce_kernel`. Pass 2 (labelled rows): logits again,
+  `head_chunk_grad_kernel` turns them in place into `256 * (softmax − onehot)`, and cuBLAS
+  multiplies them by the piece; the fp16 products are summed in fp32. `test_head_stream.py`
+  compares loss, entropy, per-token loss, accuracy and the hidden-state gradient with the
+  GPU-resident head.
 
-## Our kernels (check 4: 10.1% of the training time)
+Patches of library internals this needs, each changing where a tensor lives and nothing else:
+- `bitsandbytes.nn.Params4bit._quantize`: packed bytes to host RAM after quantizing.
+- `bitsandbytes.matmul_4bit` (outermost wrapper): a host weight is handed on as its GPU slot.
+- `transformers.core_model_loading.get_device`: `embed_tokens.weight` is loaded to the CPU.
+- `transformers.modeling_utils.caching_allocator_warmup`: skipped. It reserves the whole model's
+  size on the GPU before loading to speed up loading; most of that is now host RAM.
+- `transformers.PreTrainedModel.device`: skips our host-RAM parameters (the model computes on the
+  GPU; the Trainer moves inputs to `args.device` either way).
+- `peft.prepare_model_for_kbit_training`: keeps the tied embedding in fp16 (above), then builds
+  the layer store. `peft.get_peft_model`: peft places each new adapter on its base layer's device,
+  host RAM here, so the adapter is moved to the GPU before the optimizer is created.
+- `Module._apply` of the modules whose weights we keep in host RAM: `model.to(cuda)` (accelerate)
+  converts everything else as usual but leaves those weights where they are.
 
-| Kernel | File | Replaces | ms in the measured run (steps 3+) | Share |
-|---|---|---|---|---|
-| `nf4_dequant_kernel` | `solution/nf4.py` | bitsandbytes `kDequantizeBlockwise` (+ absmax rebuild) | 2,117 | 7.8% |
-| `_rmsnorm_backward_input` | `solution/rmsnorm.py` | PyTorch RMSNorm backward | 234 | 0.9% |
-| `fused_head_ce_kernel` | `solution/head.py` | softmax / CE / entropy / argmax over the full logits | 197 | 0.7% |
-| `_rmsnorm_forward` | `solution/rmsnorm.py` | PyTorch RMSNorm forward | 183 | 0.7% |
+What it costs: the second forward of every layer (about 10 s of the 64 steps) and the PCIe
+traffic it cannot hide (a few seconds): 45.9 s → 63–72 s, depending on the session.
+
+## Our kernels (check 4: 9.2% of the training time)
+
+| Kernel | File | Replaces |
+|---|---|---|
+| `nf4_dequant_kernel` | `solution/nf4.py` | bitsandbytes `kDequantizeBlockwise` (+ absmax rebuild), forward, recompute and backward of every `Linear4bit` |
+| `head_chunk_stats_kernel` | `solution/head_stream.py` | softmax / CE / entropy / argmax over the logits, one vocabulary piece at a time |
+| `head_chunk_grad_kernel` | `solution/head_stream.py` | the logits gradient `softmax − onehot`, one vocabulary piece at a time |
+| `_rmsnorm_backward_input` | `solution/rmsnorm.py` | PyTorch RMSNorm backward |
+| `_rmsnorm_forward` | `solution/rmsnorm.py` | PyTorch RMSNorm forward |
+| `fused_head_ce_kernel` | `solution/head.py` | the same as the two head kernels, with the head weight on the GPU (used when the offload is off) |
+
+Together they take 9.2% of the training time in the measured run (check 4, steps 3+).
 
 ## How to run
 
@@ -217,6 +237,8 @@ On Kaggle (Accelerator **GPU T4 x2**, Internet on), open the public notebook abo
 it. Nothing else needs to be set or edited. It clones this repository at the submitted commit, installs the pinned packages,
 runs our unit tests (`pytest solution`), trains base Soup and our solution, scores both adapters
 and runs the rule checks. It takes about 10 minutes.
+Do not run cells that use CUDA in the notebook process itself before the runs: the peak is
+measured over the whole GPU, so a CUDA context held by the notebook kernel (~100 MiB) is counted.
 
 Locally on a Linux machine with a CUDA GPU (only a T4 gives the official numbers):
 
@@ -233,7 +255,8 @@ SOUP_APPLY_SOLUTION=1 python -m pytest tests -q   # Soup's regression tests with
 
 `solution.apply()` takes no arguments and installs, in order: the startup patches, RMSNorm, the fused head (model and
 trainer sides), the NF4 dequantization, the example SwiGLU, the fp16 MLP, MLP unpadding, the
-packed decoder layers and the compile warm-up. To switch one off, comment out its line in
+packed decoder layers, the offload (section 8) and the compile warm-up. `ENABLED = False` in
+`offload.py` gives the faster, larger variant (45.9 s, 4,655 MiB). To switch one off, comment out its line in
 `solution/__init__.py`. The patches are independent, except that `patch_qwen2_unpad()` and
 `patch_qwen2_packed_layers()` must stay after the MLP patches.
 
@@ -248,21 +271,24 @@ packed decoder layers and the compile warm-up. To switch one off, comment out it
 | + fp16 tied embedding, compile warm-up | 1.30x | 2.83x |
 | + packed decoder layers | 1.38x | 2.75x |
 | + varlen attention on the packed tokens | **1.67x** (base 90 s; ~1.45x estimated for a 77–80 s base) | **3.08x** |
+| + startup patches | 1.63x (base 75 s) | 3.08x |
 | *option: + recompute every layer (`CHECKPOINT_LAYERS`, off)* | *1.19x* | *6.30x* |
+| + offload: NF4 weights, layer inputs, tied embedding in host RAM, streamed head | **1.24x** | **21.4x** (676 MiB) |
 
 Base Soup's wall time varies between Kaggle sessions (76–90 s), and the speed ratio moves with
 it. The training loop of our solution varies much less: 34.4 → 30.6 s from varlen attention.
 
 ## Limits and what we tried
 
-- **Recomputing every layer is a switch, and it is off.** With `CHECKPOINT_LAYERS = True` in
-  `packed.py`, each packed layer runs under our own non-reentrant `torch.utils.checkpoint`
-  (RNG preserved, so LoRA dropout replays the same masks), and only its `[n_real, 1536]` input
-  is kept for backward. Soup's `gradient_checkpointing` switch stays off. Peak memory drops to
-  **2,277 MiB (6.30x less than base Soup)**, below the ~2,400 MiB the task quotes for Unsloth,
-  but the second forward costs about 18% of the speed (1.19x with a 77 s base). By the scoring
-  formula the faster setting comes out ahead unless other teams are both much faster and much
-  lighter, so we submit it off. All checks pass with it on too.
+- **Speed for memory.** The offload costs a second forward of every layer and some PCIe time:
+  45.9 s → 63–72 s. By the scoring formula (log of each ratio, relative to the best team) the
+  move from 3.08x to ~21x memory is worth more than the speed it costs, so we submit it on.
+  `ENABLED = False` in `offload.py` restores the faster variant. The earlier
+  `CHECKPOINT_LAYERS` switch in `packed.py` (recompute without the offload, 2,277 MiB) is
+  superseded by it and stays off.
+- **The step time varies more with the offload** (0.54–1.07 s per step) than without it: long
+  batches move more bytes, and the head's two passes over the streamed vocabulary are close to
+  the PCIe limit.
 - **Recomputing the MLP was turned off.** `mlp_recompute.py` keeps only the fp16 MLP input and
   recomputes gate/up in backward, reusing one dequantization per weight. It is bit-identical and
   brings memory to **4,701 MiB (3.05x)**, but costs about 15% of the training loop (speed
@@ -279,8 +305,8 @@ it. The training loop of our solution varies much less: 34.4 → 30.6 s from var
 - **The patches are narrow.** They assume Qwen2, bitsandbytes NF4 with fp16 compute, fp16
   autocast, the pinned package versions and right padding. Anything else takes the original
   path, which is correct but slower.
-- **Step 1 is still about 1.9 s slower** than the median: absmax cache, embedding check, cuBLAS
-  start-up, and whatever compilation the model load did not hide.
+- **Step 1 is about 2.5 s slower** than the median: absmax cache, cuBLAS start-up, the first
+  layer and head copies, and whatever compilation the model load did not hide.
 - **The memory peak moves a little between runs.** The nvidia-smi peak of one commit varied by
   about ±120 MiB in our runs.
 - **The example SwiGLU still runs.** The starter kit's kernel is in the MLP. A kernel of our own
@@ -291,7 +317,7 @@ it. The training loop of our solution varies much less: 34.4 → 30.6 s from var
 | File | What it is |
 |---|---|
 | `solution/__init__.py` | `apply()`: installs the patches |
-| `solution/head.py` | fused head + loss, Triton kernel, trainer patch, fp16 tied embedding |
+| `solution/head.py` | fused head + loss, Triton kernel, trainer patch, fp16 tied embedding; hands a host-RAM weight to `head_stream.py` |
 | `solution/nf4.py` | Triton NF4 dequantization, `bnb.matmul_4bit` patch |
 | `solution/rmsnorm.py` | Triton RMSNorm forward and backward |
 | `solution/unpad.py` | token index from `attention_mask`, MLP unpadding, final scatter |
@@ -300,13 +326,15 @@ it. The training loop of our solution varies much less: 34.4 → 30.6 s from var
 | `solution/mlp_recompute.py` | MLP recomputation (off, see Limits) |
 | `solution/warmup.py` | compiles our kernels during model loading |
 | `solution/startup.py` | the two startup patches (section 7) |
-| `solution/offload.py` | NF4 weights, absmax and tied embedding in pinned host RAM, streamed; layer recompute (section 8) |
-| `solution/head_stream.py` | fused head + loss over the vocabulary streamed from host RAM, two Triton kernels |
+| `solution/offload.py` | NF4 weights and layer inputs in pinned host RAM, streamed; recompute; tied embedding in host RAM (section 8) |
+| `solution/head_stream.py` | the fused head with the vocabulary streamed from host RAM, two Triton kernels (section 8) |
 | `solution/swiglu.py` | the starter kit's example SwiGLU (not ours, not counted) |
-| `solution/test_*.py` | 52 tests: each patch against its reference path, plus a 40-step convergence test |
+| `solution/test_*.py` | 56 tests: each patch against its reference path, plus a 40-step convergence test |
 
 ## Credits
 
+- **Streaming frozen weights from host RAM, layer by layer:** the general idea of CPU offloading
+  (e.g. ZeRO-Offload, [arXiv:2101.06840](https://arxiv.org/abs/2101.06840)); our code is our own.
 - **Fused linear cross-entropy in chunks:** idea from Liger Kernel
   ([arXiv:2410.10989](https://arxiv.org/abs/2410.10989)).
 - **Online softmax statistics:** Milakov & Gimelshein (2018); Cut Your Losses

@@ -22,7 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
-VCHUNK = 8192  # vocabulary rows per piece: 8192 x 1536 x 2 B = 24 MB per slot
+VCHUNK = 4096  # vocabulary rows per piece: 4096 x 1536 x 2 B = 12 MB per slot
 BLOCK = 4096  # as head.BLOCK: VCHUNK must be a multiple of it
 IGNORE_INDEX = -100
 GRAD_SCALE = 256.0
