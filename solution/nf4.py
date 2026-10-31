@@ -77,15 +77,47 @@ def absmax_fp32(quant_state):
     return absmax
 
 
+class _Launch:
+    """Everything a dequant launch of one frozen weight needs except the output buffer, built on
+    the first call and reused (389 launches a step go through this)."""
+
+    __slots__ = ("state", "q", "absmax", "lut", "n_bytes", "grid", "half", "shape")
+
+    def __init__(self, packed, quant_state):
+        self.state = quant_state
+        self.q = packed.data.reshape(-1)  # a plain tensor even when `packed` is a Params4bit
+        self.absmax = absmax_fp32(quant_state)
+        self.lut = _lut(self.q.device)
+        self.n_bytes = self.q.numel()
+        self.grid = (triton.cdiv(self.n_bytes, BLOCK),)
+        self.half = quant_state.blocksize // 2
+        self.shape = tuple(quant_state.shape)
+
+
+_LAUNCH: dict = {}
+
+
+def _same_weight(q, packed) -> bool:
+    """`packed` is a fresh .t() view on every Linear4bit call, so compare storage, not objects.
+    The cached view keeps that storage alive, so its address cannot pass to another weight."""
+    return (q.data_ptr() == packed.data_ptr() and q.numel() == packed.numel()
+            and q.dtype == packed.dtype and q.device == packed.device)
+
+
+def _launch(packed, quant_state):
+    hit = _LAUNCH.get(id(quant_state))
+    if hit is None or hit.state is not quant_state or not _same_weight(hit.q, packed):
+        hit = _LAUNCH[id(quant_state)] = _Launch(packed, quant_state)
+    return hit
+
+
 def dequantize_nf4(packed, quant_state, dtype=torch.float16):
     """[N, K] weight of a 4-bit NF4 tensor, as bitsandbytes.functional.dequantize_4bit."""
-    n, k = quant_state.shape
-    q = packed.data.reshape(-1)  # a plain tensor even when `packed` is a Params4bit
-    out = torch.empty((n, k), dtype=dtype, device=q.device)
-    n_bytes = q.numel()
-    nf4_dequant_kernel[(triton.cdiv(n_bytes, BLOCK),)](
-        q, absmax_fp32(quant_state), _lut(q.device), out, n_bytes,
-        HALF_BLOCK=quant_state.blocksize // 2, BLOCK=BLOCK, num_warps=4,
+    ln = _launch(packed, quant_state)
+    out = torch.empty(ln.shape, dtype=dtype, device=ln.q.device)
+    nf4_dequant_kernel[ln.grid](
+        ln.q, ln.absmax, ln.lut, out, ln.n_bytes,
+        HALF_BLOCK=ln.half, BLOCK=BLOCK, num_warps=4,
     )
     return out
 
@@ -127,8 +159,25 @@ def weight_ok(B, quant_state) -> bool:
     return not quant_state.nested or getattr(quant_state.state2, "blocksize", None) == 256
 
 
+_OK: dict = {}
+
+
+def _weight_ok_cached(B, quant_state) -> bool:
+    """weight_ok() of a frozen weight, evaluated once per (weight, quant_state) pair."""
+    if not ENABLED:
+        return False
+    hit = _OK.get(id(quant_state))
+    if (hit is None or hit[0] is not quant_state or not isinstance(B, torch.Tensor)
+            or not _same_weight(hit[1], B)):
+        ok = weight_ok(B, quant_state)
+        if not isinstance(B, torch.Tensor):
+            return ok
+        hit = _OK[id(quant_state)] = (quant_state, B.data.reshape(-1), ok)
+    return hit[2]
+
+
 def _usable(A, B, quant_state, out, bias) -> bool:
-    if out is not None or not weight_ok(B, quant_state):
+    if out is not None or not _weight_ok_cached(B, quant_state):
         return False
     if not (isinstance(A, torch.Tensor) and A.is_cuda and A.dtype == torch.float16 and A.numel()):
         return False

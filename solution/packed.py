@@ -157,8 +157,8 @@ def _proj(layer, x, st):
         if lora_a.weight.dtype != x.dtype:
             return st.gather(layer(st.scatter(x)))
         dropped = st.gather(
-            dropout(st.scatter(x))
-        )  # same draws as dropout on [B, T, hidden]
+            dropout(st.scatter_for_dropout(x))
+        )  # same draws as dropout on [B, T, hidden]; pad rows are dropped again
         result = result + lora_b(lora_a(dropped)) * scaling
     return result
 

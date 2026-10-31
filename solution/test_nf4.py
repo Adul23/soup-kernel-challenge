@@ -56,3 +56,25 @@ def test_linear4bit_forward_backward_identical():
     assert y_new.dtype == y_ref.dtype
     assert torch.equal(y_new, y_ref)
     assert torch.equal(g_new, g_ref)
+
+
+def test_launch_cache_follows_the_weight():
+    """The cached launch arguments are reused for the same weight (also through a fresh .t()
+    view, as Linear4bit passes it) and rebuilt when a quant_state's weight changes."""
+    import bitsandbytes.functional as bnbf
+
+    torch.manual_seed(0)
+    w = torch.randn(256, 1536, device="cuda", dtype=torch.float16) * 0.05
+    q, qs = bnbf.quantize_4bit(w, blocksize=64, compress_statistics=True, quant_type="nf4")
+    ref = bnbf.dequantize_4bit(q, qs)
+    assert torch.equal(nf4.dequantize_nf4(q, qs), ref)
+    first = nf4._LAUNCH[id(qs)]
+    assert torch.equal(nf4.dequantize_nf4(q.t(), qs), ref)
+    assert nf4._LAUNCH[id(qs)] is first
+    assert nf4._weight_ok_cached(q.t(), qs) and nf4._weight_ok_cached(q.t(), qs)
+
+    q2 = q.clone()
+    q2[:7] ^= 0x5A  # another weight under the same quant_state object
+    ref2 = bnbf.dequantize_4bit(q2, qs)
+    assert torch.equal(nf4.dequantize_nf4(q2, qs), ref2)
+    assert nf4._LAUNCH[id(qs)] is not first

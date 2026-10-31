@@ -68,6 +68,13 @@ class State:
         """[n_real, d] -> [B*T, d] with zeros at the pads (autograd-safe, out of place)."""
         return x.new_zeros((self.n_flat, x.shape[-1])).index_copy(0, self.idx, x)
 
+    def scatter_for_dropout(self, x):
+        """Like scatter(), but the pad rows are left uninitialised: for an input whose pad rows
+        are discarded right after a per-element op (LoRA dropout, then gather). Only the
+        shape matters there, for the RNG draws; pad rows also get no gradient."""
+        out = x.new_empty((self.n_flat, x.shape[-1]))
+        return out.index_copy_(0, self.idx, x)
+
     def rope(self, cos, sin):
         """cos/sin [B or 1, T, d] gathered to [n_real, d], once per forward."""
         key = (id(cos), id(sin))

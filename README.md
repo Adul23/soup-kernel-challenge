@@ -72,6 +72,10 @@ Our version:
   one fp32 multiply each, rounded to fp16 on store.
 - **The absmax of each frozen weight is rebuilt once**, by bitsandbytes itself, and cached
   (about 80 MB).
+- **Launch arguments are cached per weight** (flat packed view, absmax, LUT, size, grid): the
+  hook runs 389 times a step, so the per-call Python work is a dict lookup plus a storage check
+  (`data_ptr`, size, dtype, device), since Linear4bit passes a fresh `.t()` view each call. The
+  launch itself still goes through `nf4_dequant_kernel[grid](...)`.
 - **Same numbers:** the output is bit-identical to bitsandbytes (`test_nf4.py`). The matmuls
   stay in cuBLAS, as in the base.
 
@@ -110,7 +114,10 @@ missing, q/k/v are scattered into the padded layout for SDPA, as in base Soup.
 LoRA dropout draws one random number per element, so we apply it to the scattered `[B*T, 1536]`
 input, as base Soup does: the same number of draws in the same order. The masks at real
 positions are then the same, and the RNG stream ends where base Soup leaves it. `test_packed.py`
-checks this by comparing CUDA RNG states.
+checks this by comparing CUDA RNG states. The pad rows of that scattered input are left
+uninitialised (`State.scatter_for_dropout`): dropout is per element, and the pad rows are
+discarded by the gather right after it and get no gradient, so only the shape matters
+(`test_unpad.py` checks equal outputs, gradients and RNG state).
 
 ### 6. Kernel compilation off the critical path (`warmup.py`)
 

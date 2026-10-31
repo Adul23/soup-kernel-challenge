@@ -69,3 +69,29 @@ def test_tiny_qwen2_loss_and_grads_match(dtype):
     assert grads.keys() == grads_ref.keys()
     for name in grads:
         torch.testing.assert_close(grads[name], grads_ref[name], **tol, msg=name)
+
+
+def test_scatter_for_dropout_same_masks_and_grads():
+    """Dropout over the uninitialised-pad scatter gives the same real rows, the same RNG draws
+    and the same gradient as over the zero-pad scatter."""
+    b, t, h = 3, 7, 16
+    mask = torch.ones(b, t, dtype=torch.long, device=DEVICE)
+    mask[0, 4:] = 0
+    mask[2, 2:] = 0
+    idx = unpad.token_index(mask, b, t)
+    st = unpad.State(idx, b, t, True, mask=mask)
+    x = torch.randn(idx.numel(), h, device=DEVICE, requires_grad=True)
+    drop = torch.nn.Dropout(0.05)
+    g = torch.randn(idx.numel(), h, device=DEVICE)
+
+    def run(scatter):
+        torch.manual_seed(1)
+        y = st.gather(drop(scatter(x)))
+        (gx,) = torch.autograd.grad((y * g).sum(), x)
+        return y, gx, torch.rand(1, device=DEVICE)  # where the RNG stream was left
+
+    y_ref, g_ref, r_ref = run(st.scatter)
+    y_new, g_new, r_new = run(st.scatter_for_dropout)
+    assert torch.equal(y_new, y_ref)
+    assert torch.equal(g_new, g_ref)
+    assert torch.equal(r_new, r_ref)
