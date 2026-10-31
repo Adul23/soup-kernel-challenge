@@ -35,7 +35,7 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-CHUNK = 128  # tokens per logits buffer: 512 x 151 936 x 2 B = 155 MB
+CHUNK = 128  # tokens per logits buffer: 128 x 151 936 x 2 B = 39 MB
 BLOCK = 4096  # vocabulary entries per kernel iteration
 GRAD_SCALE = 256.0  # fp16 headroom for softmax - onehot; divided out in fp32 afterwards
 ENABLED = True  # tests flip this to get the reference path
@@ -148,10 +148,22 @@ class FusedHeadLoss(torch.autograd.Function):
             )
 
             rows_max = max(rows_lab.numel(), rows_ent.numel(), 1)
-            buf = torch.empty(
-                (min(chunk, rows_max), v), dtype=torch.float16, device=dev
-            )
-            for rows, write_grad in ((rows_lab, need_grad), (rows_ent, False)):
+            streamed = (
+                not weight16.is_cuda
+            )  # tied weight in pinned host RAM (offload.py)
+            if streamed:
+                from .head_stream import head_streamed
+
+                token_loss, token_entropy, correct, grad = head_streamed(
+                    h, weight16, tgt, rows_lab, rows_ent, need_grad
+                )
+            else:
+                buf = torch.empty(
+                    (min(chunk, rows_max), v), dtype=torch.float16, device=dev
+                )
+            for rows, write_grad in (
+                () if streamed else ((rows_lab, need_grad), (rows_ent, False))
+            ):
                 for s0 in range(0, rows.numel(), chunk):
                     r = rows[s0 : s0 + chunk]
                     c = r.numel()

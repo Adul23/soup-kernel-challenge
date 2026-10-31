@@ -18,10 +18,14 @@ What stays on the GPU in base Soup for the whole run, and what we do instead:
    the recompute, so LoRA dropout draws the same masks, and the global RNG ends where base Soup
    leaves it. Autocast is re-entered with the forward's settings.
 
-3. transformers reserves the model's whole size on the GPU before loading (a load-speed trick,
+3. The tied fp16 embedding / head matrix (467 MB) is loaded straight into pinned host RAM. The
+   embedding rows of a batch are gathered on the CPU and copied over; the fused head streams the
+   vocabulary in 8192-row pieces through two GPU slots (head_stream.py).
+
+4. transformers reserves the model's whole size on the GPU before loading (a load-speed trick,
    caching_allocator_warmup); we skip it, since most of that would now be host RAM.
 
-4. peft's prepare_model_for_kbit_training widens the frozen tied embedding fp16 -> fp32
+5. peft's prepare_model_for_kbit_training widens the frozen tied embedding fp16 -> fp32
    (0.47 GB -> 0.93 GB, both alive during the cast). We leave it in fp16 and widen the embedding
    output to fp32 with a forward hook: the residual stream sees exactly the same fp32 numbers
    (an fp16 value widened is exact), and the head uses the fp16 weight as it already did
@@ -37,6 +41,9 @@ import functools
 import torch
 
 ENABLED = True  # stream NF4 weights + recompute layers (needs the store, see below)
+EMBED_HOST = (
+    True  # tied fp16 embedding / head weight in pinned host RAM (head_stream.py)
+)
 OFFLOAD_INPUTS = True  # keep the per-layer recompute inputs in pinned host RAM
 _STORE = {"store": None}
 
@@ -73,6 +80,7 @@ def patch_params4bit():
             self.data = (
                 self.data.cpu()
             )  # quant_state (absmax, ~20 MB in all) stays on the GPU
+            self._soup_host = True
         return out
 
     cls._quantize = _quantize
@@ -99,6 +107,7 @@ class LayerStore:
                     w.data.reshape(-1)
                 )  # from host or (tests) the GPU
                 w.data = host[off : off + n].view(w.shape)
+                w._soup_host = True
                 self.where[w.data_ptr()] = (i, off, n)
                 off += n
             self.host.append(host)
@@ -266,6 +275,90 @@ def _upcast_output(module, inputs, output):
     return output.float()
 
 
+def _host_embedding_forward(self, input_ids):
+    """nn.Embedding.forward with the fp16 table in pinned host RAM: the rows are gathered on the
+    CPU (a few MB per step) and copied to the GPU. Same values as the lookup on the GPU."""
+    w = self.weight
+    if w.is_cuda:
+        return torch.nn.functional.embedding(
+            input_ids,
+            w,
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+    ids = input_ids.to("cpu")
+    rows = torch.empty((*ids.shape, w.shape[1]), dtype=w.dtype, pin_memory=True)
+    torch.index_select(w.detach(), 0, ids.reshape(-1), out=rows.view(-1, w.shape[1]))
+    return rows.to(input_ids.device, non_blocking=True)
+
+
+def _host_head_forward(self, x):
+    """lm_head outside the fused training head (not used in training): weight copied over."""
+    w = self.weight
+    if w.is_cuda or not x.is_cuda:
+        return torch.nn.functional.linear(x, w, self.bias)
+    return torch.nn.functional.linear(x, w.to(x.device, non_blocking=True), self.bias)
+
+
+def move_embedding_to_host(model):
+    """The tied fp16 embedding / head matrix (467 MB) to pinned host RAM."""
+    embed = model.get_input_embeddings()
+    head = model.get_output_embeddings()
+    w = embed.weight
+    if (
+        not EMBED_HOST
+        or w.dtype != torch.float16
+        or w.requires_grad
+        or embed.max_norm is not None
+        or (head is not None and head.weight is not w)
+    ):
+        if (
+            not w.is_cuda
+        ):  # loaded to host RAM (patch_loader_device) but not usable there
+            w.data = w.data.to(_cuda())
+        return False
+    if w.is_cuda:
+        host = torch.empty(w.shape, dtype=w.dtype, pin_memory=True)
+        host.copy_(w.data)
+    else:
+        host = w.data if w.data.is_pinned() else w.data.pin_memory()
+    w.data = host
+    w._soup_host = True
+    embed.forward = _host_embedding_forward.__get__(embed)
+    if head is not None:
+        head.forward = _host_head_forward.__get__(head)
+    torch.cuda.empty_cache()
+    print(
+        "[solution.offload] tied fp16 embedding / head in pinned host RAM", flush=True
+    )
+    return True
+
+
+def patch_model_device():
+    """PreTrainedModel.device is its first parameter's device, and the first parameter is now the
+    embedding in host RAM. The model computes on the GPU, so skip the parameters we keep in host
+    RAM (inputs are still moved by the Trainer to args.device either way)."""
+    from transformers import modeling_utils
+
+    cls = modeling_utils.PreTrainedModel
+    original = cls.device
+    if getattr(original.fget, "_soup_offload", False):
+        return
+
+    def device(self):
+        for p in self.parameters():
+            if not getattr(p, "_soup_host", False):
+                return p.device
+        return original.fget(self)
+
+    prop = property(device)
+    prop.fget._soup_offload = True
+    cls.device = prop
+
+
 def patch_peft():
     import peft
 
@@ -300,6 +393,14 @@ def patch_peft():
                 _upcast_output
             )  # the fp32 output the cast would give
         build_store(model)
+        if keep16 and _STORE["store"] is not None:
+            move_embedding_to_host(model)
+        else:
+            w = getattr(model.get_input_embeddings(), "weight", None)
+            if (
+                w is not None and not w.is_cuda
+            ):  # loaded to host RAM: back as base Soup has it
+                w.data = w.data.to(_cuda())
         return model
 
     @functools.wraps(get_peft_model)
@@ -339,10 +440,35 @@ def patch_loader_warmup():
     modeling_utils._soup_offload = True
 
 
+def patch_loader_device():
+    """Load the tied embedding (467 MB in fp16) straight into host RAM instead of loading it on
+    the GPU and moving it afterwards: the device transformers picks for that one tensor."""
+    from transformers import core_model_loading as cml
+
+    if getattr(cml, "_soup_offload", False):
+        return
+    original = cml.get_device
+
+    @functools.wraps(original)
+    def get_device(device_map, name, *args, **kwargs):
+        if ENABLED and EMBED_HOST and str(name).endswith("embed_tokens.weight"):
+            return "cpu"
+        return original(device_map, name, *args, **kwargs)
+
+    cml.get_device = get_device
+    cml._soup_offload = True
+
+
 def patch_offload():
     if not ENABLED:
         return
     patch_loader_warmup()
+    patch_loader_device()
+    patch_model_device()
     patch_params4bit()
     patch_matmul_4bit()
     patch_peft()
+    if EMBED_HOST:
+        from .head_stream import start_warmup
+
+        start_warmup()  # compiles the streamed head kernels while Soup loads the model
