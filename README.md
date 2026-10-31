@@ -151,6 +151,55 @@ between runs, and behave the same under measurement and tests. They do not count
   everything downstream are identical; Soup's rewind fingerprint hashes the rows themselves.
   `test_startup.py` checks the rows, the random states and that no hashing happened.
 
+### 8. Frozen weights in host RAM, every layer recomputed (`offload.py`, `head_stream.py`)
+
+This is what takes the peak from 4,657 MiB to about 550 MiB. Everything frozen lives in pinned
+host RAM and crosses PCIe while the GPU computes; the GPU keeps only the LoRA adapters, their
+optimizer state, two weight slots and the activations of the layer that is running. All of it
+is our own code (offloading and recomputation in `solution/`, as the organizers allowed); Soup's
+`gradient_checkpointing`, layer streaming and other switches stay off.
+
+- **NF4 weights stream one layer at a time.** Right after bitsandbytes quantizes a weight on
+  the GPU during loading, its packed bytes move to host RAM (`Params4bit._quantize` hook), so
+  they never pile up on the GPU. When the model is ready, each decoder layer's bytes go into one
+  pinned buffer (703 MiB for 28 layers). Two GPU slots hold two layers: while layer *i*
+  computes, layer *i+1* (forward) or *i−1* (backward) is copied in on a side stream. CUDA
+  events order each copy after the last kernel that read the slot, and the compute stream waits
+  for the copy. The bytes are the same, and `nf4_dequant_kernel` dequantizes them as before.
+- **The fp32 absmax streams with its layer.** It is rebuilt once per weight by bitsandbytes,
+  as before, and stored after the layer's NF4 bytes in the same pinned buffer, so the same copy
+  brings it into the slot (about 82 MB that no longer stay on the GPU). `test_offload.py`
+  checks with `torch.equal` that every weight dequantizes exactly as bitsandbytes does, from
+  the slot and outside it.
+- **Every layer is recomputed in backward** by our own autograd Function. Only the layer input
+  `[n_real, 1536]` is kept, and it is copied to a pinned buffer per layer on a side stream and
+  brought back for that layer's backward. The CUDA RNG state is saved per layer and restored
+  for the recompute, so LoRA dropout draws the same masks, and the RNG stream ends where base
+  Soup leaves it (`test_offload.py` compares RNG states, loss and gradients). Autocast is
+  re-entered with the forward's settings.
+- **The tied fp16 embedding / head matrix (467 MB) is loaded straight into pinned host RAM**
+  (the device transformers picks for that one tensor). The embedding rows of a batch are
+  gathered on the CPU and copied over; an fp16 value widened to fp32 is exact, so the residual
+  stream sees the same numbers. The fused head (`head_stream.py`) puts the vocabulary in the
+  outer loop: 8,192-row pieces come in through two GPU slots, and each piece is used for all
+  token rows. Pass 1 computes the logits of a piece with cuBLAS, and `head_chunk_stats_kernel`
+  carries each row's online max, sum-exp, entropy sum, first-index argmax and target logit
+  across the pieces, visiting the blocks in the same order with the same arithmetic as
+  `fused_head_ce_kernel`. Pass 2 recomputes the logits, `head_chunk_grad_kernel` turns them in
+  place into `256 · (softmax − onehot)`, and cuBLAS multiplies them by the piece; the pieces'
+  products are summed in fp32. So the matrix crosses PCIe twice per step instead of living on
+  the GPU (`test_head_stream.py`).
+- **Loading:** transformers' `caching_allocator_warmup` reserves the whole model's size on the
+  GPU before loading (a load-speed trick). With the weights going to host RAM that block would
+  be the peak of the run, so we skip it; no value changes. peft's
+  `prepare_model_for_kbit_training` would widen the frozen tied embedding to fp32; we keep it in
+  fp16 (allowed by the organizers when exact) and widen the embedding output with a forward
+  hook. `PreTrainedModel.device` skips our host-RAM parameters, and the new LoRA adapters are
+  moved to the GPU before the optimizer is built.
+- **Cost:** the recompute is a second forward of every layer, and the head computes its logits
+  twice. The training loop takes about 51.5 s instead of 30.6 s. By the scoring formula the
+  memory gain outweighs that.
+
 ## Our kernels (check 4: 10.1% of the training time)
 
 | Kernel | File | Replaces | ms in the measured run (steps 3+) | Share |
@@ -251,6 +300,8 @@ it. The training loop of our solution varies much less: 34.4 → 30.6 s from var
 | `solution/mlp_recompute.py` | MLP recomputation (off, see Limits) |
 | `solution/warmup.py` | compiles our kernels during model loading |
 | `solution/startup.py` | the two startup patches (section 7) |
+| `solution/offload.py` | NF4 weights, absmax and tied embedding in pinned host RAM, streamed; layer recompute (section 8) |
+| `solution/head_stream.py` | fused head + loss over the vocabulary streamed from host RAM, two Triton kernels |
 | `solution/swiglu.py` | the starter kit's example SwiGLU (not ours, not counted) |
 | `solution/test_*.py` | 52 tests: each patch against its reference path, plus a 40-step convergence test |
 
