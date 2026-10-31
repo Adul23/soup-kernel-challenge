@@ -5,15 +5,17 @@ slots, the next piece copied on a side stream while the current one is used), an
 is used for all token rows at once, so the 467 MB matrix crosses PCIe twice per step instead of
 living on the GPU.
 
-Pass 1 (all real rows): logits of the piece by cuBLAS (fp16 in, fp32 accumulate, fp16 out, as
-autocast would), then `head_chunk_stats_kernel` carries each row's online max / sum-exp /
-entropy sum / first-index argmax / target logit across pieces in fp32 arrays. VCHUNK is a
-multiple of BLOCK, so the blocks are visited in the same order with the same arithmetic as
-`fused_head_ce_kernel` in head.py; the last piece writes loss, entropy, correct and the
-log-sum-exp.
-Pass 2 (labelled rows): logits again, `head_chunk_grad_kernel` turns them in place into
-GRAD_SCALE * (softmax - onehot), and cuBLAS multiplies them by the piece of the weight; the
-pieces' fp16 products are summed in fp32 into the hidden-state gradient.
+One pass over the vocabulary does everything. For each piece, cuBLAS computes the logits of all
+real rows (fp16 in, fp32 accumulate, fp16 out, as autocast would), and `head_chunk_stats_kernel`
+carries each row's online max / sum-exp / entropy sum / first-index argmax / target logit across
+pieces in fp32 arrays (VCHUNK is a multiple of BLOCK, so the blocks are visited in the same order
+with the same arithmetic as `fused_head_ce_kernel` in head.py; the last piece writes loss,
+entropy, correct and the log-sum-exp). For labelled rows the kernel also overwrites the piece's
+logits with GRAD_SCALE * exp(z - m), relative to the running max m, and returns the factor
+exp(m_before - m); cuBLAS then accumulates acc = acc * factor + P @ W_piece in fp32, as flash
+attention accumulates its output. At the end, softmax @ W = acc / sum-exp, and the hidden-state
+gradient is GRAD_SCALE * (softmax @ W - W[target]). So the weight crosses PCIe once per step and
+the logits are computed once, instead of a second pass for the gradient.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ IGNORE_INDEX = -100
 GRAD_SCALE = 256.0
 
 
-@triton.jit(do_not_specialize=["v0", "VC", "FIRST", "LAST"])
+@triton.jit(do_not_specialize=["v0", "VC", "FIRST", "LAST", "KLAB"])
 def head_chunk_stats_kernel(
     LOGITS,
     stride_row,
@@ -47,7 +49,10 @@ def head_chunk_stats_kernel(
     VC,
     FIRST,
     LAST,
+    ALPHA,
+    KLAB,
     IGNORE: tl.constexpr,
+    GRAD_SCALE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -76,6 +81,18 @@ def head_chunk_stats_kernel(
         arg = tl.where(take, barg + start + v0, arg)
         best = tl.maximum(best, bmax)
         zt += tl.sum(tl.where(offs + v0 == tgt, z, 0.0), axis=0)
+    # One pass for the gradient too (as flash attention accumulates its output): labelled rows
+    # get P = GRAD_SCALE * exp(z - m) for this piece, relative to the running max m, and ALPHA =
+    # exp(m_before - m) rescales what was accumulated from the earlier pieces.
+    m_before = tl.where(first, float("-inf"), tl.load(M + row))
+    lab_row = row < KLAB
+    tl.store(ALPHA + row, tl.exp(m_before - m), mask=lab_row)
+    for start in range(0, VC, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        msk = (offs < VC) & lab_row
+        z = tl.load(ptr + offs, mask=msk, other=0.0).to(tl.float32)
+        p = tl.exp(z - m) * GRAD_SCALE
+        tl.store(ptr + offs, p.to(LOGITS.dtype.element_ty), mask=msk)
     last = LAST != 0
     lse = m + tl.log(d)
     labelled = tgt != IGNORE
@@ -89,30 +106,6 @@ def head_chunk_stats_kernel(
     tl.store(ZT + row, zt)
     tl.store(BEST + row, best)
     tl.store(ARG + row, arg)
-
-
-@triton.jit(do_not_specialize=["v0", "VC"])
-def head_chunk_grad_kernel(
-    LOGITS,
-    stride_row,
-    TARGET,
-    LSE,
-    v0,
-    VC,
-    GRAD_SCALE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    ptr = LOGITS + row * stride_row
-    tgt = tl.load(TARGET + row)
-    lse = tl.load(LSE + row)
-    for start in range(0, VC, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        msk = offs < VC
-        z = tl.load(ptr + offs, mask=msk, other=0.0).to(tl.float32)
-        p = tl.exp(z - lse)
-        g = tl.where(offs + v0 == tgt, p - 1.0, p) * GRAD_SCALE
-        tl.store(ptr + offs, g.to(LOGITS.dtype.element_ty), mask=msk)
 
 
 class _Pieces:
@@ -158,7 +151,7 @@ def _warmup():
     dev = torch.device("cuda", torch.cuda.current_device())
     logits = torch.empty((1, VCHUNK), dtype=torch.float16, device=dev)
     t = torch.zeros(1, dtype=torch.long, device=dev)
-    f = [torch.empty(1, dtype=torch.float32, device=dev) for _ in range(8)]
+    f = [torch.empty(1, dtype=torch.float32, device=dev) for _ in range(9)]
     i = [torch.empty(1, dtype=torch.int32, device=dev) for _ in range(2)]
     head_chunk_stats_kernel.warmup(
         logits,
@@ -178,18 +171,9 @@ def _warmup():
         VCHUNK,
         1,
         0,
+        f[8],
+        1,
         IGNORE=IGNORE_INDEX,
-        BLOCK=BLOCK,
-        num_warps=8,
-        grid=(1,),
-    )
-    head_chunk_grad_kernel.warmup(
-        logits,
-        VCHUNK,
-        t,
-        f[7],
-        0,
-        VCHUNK,
         GRAD_SCALE=GRAD_SCALE,
         BLOCK=BLOCK,
         num_warps=8,
@@ -238,8 +222,16 @@ def head_streamed(h, weight_host, tgt, rows_lab, rows_ent, need_grad):
     cor_k = torch.empty(k, dtype=torch.int32, device=dev)
     logits = torch.empty((k, VCHUNK), dtype=torch.float16, device=dev)
 
+    want_grad = bool(need_grad and k_lab)
+    alpha = torch.empty(k, **f32)
+    acc = torch.zeros((k_lab, dim), **f32) if want_grad else None
+
     pieces = _Pieces(weight_host, dev)
-    for j, v0, w in pieces:  # pass 1: statistics over the whole vocabulary
+    for (
+        j,
+        v0,
+        w,
+    ) in pieces:  # one pass: statistics and gradient over the whole vocabulary
         vc = w.shape[0]
         out = logits[:, :vc]
         torch.mm(x, w.t(), out=out)
@@ -261,33 +253,24 @@ def head_streamed(h, weight_host, tgt, rows_lab, rows_ent, need_grad):
             vc,
             int(j == 0),
             int(j == pieces.n - 1),
+            alpha,
+            k_lab if want_grad else 0,
             IGNORE=IGNORE_INDEX,
+            GRAD_SCALE=GRAD_SCALE,
             BLOCK=BLOCK,
             num_warps=8,
         )
+        if want_grad:  # acc = acc * alpha + P @ W_piece, fp32 accumulation
+            acc.mul_(alpha[:k_lab, None]).add_(torch.mm(out[:k_lab], w))
     token_loss.index_copy_(0, rows, loss_k)
     token_entropy.index_copy_(0, rows, ent_k)
     correct += cor_k.sum()
 
-    if need_grad and k_lab:
-        xl, tl_, lse_l = x[:k_lab], t[:k_lab], lse[:k_lab]
-        gl = logits[:k_lab]
-        acc = torch.zeros((k_lab, dim), **f32)
-        for j, v0, w in pieces:  # pass 2: gradient piece by piece
-            vc = w.shape[0]
-            out = gl[:, :vc]
-            torch.mm(xl, w.t(), out=out)
-            head_chunk_grad_kernel[(k_lab,)](
-                out,
-                logits.stride(0),
-                tl_,
-                lse_l,
-                v0,
-                vc,
-                GRAD_SCALE=GRAD_SCALE,
-                BLOCK=BLOCK,
-                num_warps=8,
-            )
-            acc += torch.mm(out, w).float()
+    if want_grad:
+        # GRAD_SCALE * (softmax @ W - W[target]) for the labelled rows; the caller divides
+        # by denominator * GRAD_SCALE, as for the resident head
+        t_cpu = t[:k_lab].to("cpu")
+        w_tgt = weight_host.index_select(0, t_cpu).to(dev, non_blocking=True)
+        acc.div_(d[:k_lab, None]).sub_(w_tgt.float().mul_(GRAD_SCALE))
         grad.index_copy_(0, rows_lab, acc)
     return token_loss, token_entropy, correct, grad
