@@ -60,11 +60,12 @@ def _lut(device):
     return lut
 
 
-def absmax_fp32(quant_state):
-    """The fp32 absmax bitsandbytes rebuilds on every call, rebuilt once by bitsandbytes."""
-    hit = _ABSMAX.get(id(quant_state))
-    if hit is not None and hit[0] is quant_state:
-        return hit[1]
+# offload.py: fn(quant_state) -> the fp32 absmax on the GPU (streamed with the layer), or None.
+ABSMAX_SOURCE = None
+
+
+def build_absmax_fp32(quant_state):
+    """The fp32 absmax bitsandbytes rebuilds on every call, rebuilt here by bitsandbytes."""
     import bitsandbytes.functional as bnbf
 
     if quant_state.nested:
@@ -72,21 +73,33 @@ def absmax_fp32(quant_state):
         absmax = absmax + quant_state.offset
     else:
         absmax = quant_state.absmax
-    absmax = absmax.float().contiguous()
+    return absmax.float().contiguous()
+
+
+def absmax_fp32(quant_state):
+    """build_absmax_fp32(), once per weight: cached here unless offload.py streams it."""
+    if ABSMAX_SOURCE is not None:
+        absmax = ABSMAX_SOURCE(quant_state)
+        if absmax is not None:
+            return absmax
+    hit = _ABSMAX.get(id(quant_state))
+    if hit is not None and hit[0] is quant_state:
+        return hit[1]
+    absmax = build_absmax_fp32(quant_state)
     _ABSMAX[id(quant_state)] = (quant_state, absmax)
     return absmax
 
 
 class _Launch:
-    """Everything a dequant launch of one frozen weight needs except the output buffer, built on
-    the first call and reused (389 launches a step go through this)."""
+    """Everything a dequant launch of one frozen weight needs except the output buffer and the
+    absmax (which offload.py may stream), built on the first call and reused (389 launches a
+    step go through this)."""
 
-    __slots__ = ("state", "q", "absmax", "lut", "n_bytes", "grid", "half", "shape")
+    __slots__ = ("state", "q", "lut", "n_bytes", "grid", "half", "shape")
 
     def __init__(self, packed, quant_state):
         self.state = quant_state
         self.q = packed.data.reshape(-1)  # a plain tensor even when `packed` is a Params4bit
-        self.absmax = absmax_fp32(quant_state)
         self.lut = _lut(self.q.device)
         self.n_bytes = self.q.numel()
         self.grid = (triton.cdiv(self.n_bytes, BLOCK),)
@@ -116,7 +129,7 @@ def dequantize_nf4(packed, quant_state, dtype=torch.float16):
     ln = _launch(packed, quant_state)
     out = torch.empty(ln.shape, dtype=dtype, device=ln.q.device)
     nf4_dequant_kernel[ln.grid](
-        ln.q, ln.absmax, ln.lut, out, ln.n_bytes,
+        ln.q, absmax_fp32(quant_state), ln.lut, out, ln.n_bytes,
         HALF_BLOCK=ln.half, BLOCK=BLOCK, num_warps=4,
     )
     return out

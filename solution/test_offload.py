@@ -127,3 +127,39 @@ def test_streamed_layers_match():
             torch.testing.assert_close(
                 grads[name], g, rtol=1e-2, atol=1e-3 * scale + 1e-8, msg=name
             )
+
+
+def test_streamed_absmax_bit_identical():
+    """The fp32 absmax streamed with each layer dequantizes every weight exactly as
+    bitsandbytes does, from the slot and from a private copy, and is not cached on the GPU."""
+    import bitsandbytes.functional as bnbf
+
+    from solution import nf4, offload
+
+    offload.patch_matmul_4bit()  # installs nf4.ABSMAX_SOURCE
+    offload._STORE["store"] = None
+    model = _model()
+    mods = [m for m in model.modules() if offload._is_nf4_linear(m)]
+    refs = {
+        id(m): bnbf.dequantize_4bit(m.weight.data.to("cuda"), m.weight.quant_state)
+        for m in mods
+    }
+    store = offload.build_store(model)
+    try:
+        for i, layer in enumerate(store.layers):
+            for m in layer.modules():
+                if not offload._is_nf4_linear(m):
+                    continue
+                qs = m.weight.quant_state
+                assert torch.equal(  # outside the layer: private copies
+                    nf4.dequantize_nf4(store.gpu_weight(m.weight), qs), refs[id(m)]
+                )
+                store.ensure(i)
+                assert store.absmax(qs).data_ptr() >= store.slots[i % 2].data_ptr()
+                assert torch.equal(
+                    nf4.dequantize_nf4(store.gpu_weight(m.weight), qs), refs[id(m)]
+                )
+                store.release(i)
+                assert nf4._ABSMAX.get(id(qs), (None,))[0] is not qs
+    finally:
+        offload._STORE["store"] = None

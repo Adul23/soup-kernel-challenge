@@ -9,7 +9,10 @@ What stays on the GPU in base Soup for the whole run, and what we do instead:
    hold two layers: while layer i computes, layer i+1 (forward) or i-1 (backward) is copied in on
    a side stream (PCIe, ~23 MB per layer). CUDA events order the copy after the last kernel that
    used the slot, and the compute stream waits for the copy. The weights are the same bytes;
-   our `nf4_dequant_kernel` dequantizes them exactly as before.
+   our `nf4_dequant_kernel` dequantizes them exactly as before. The fp32 absmax of each weight
+   (rebuilt once by bitsandbytes from its double quantization, ~82 MB for the model) sits after
+   the layer's NF4 bytes in the same pinned buffer and comes over in the same copy, so it does
+   not stay on the GPU either.
 
 2. The activations of every layer. Each decoder layer is recomputed in backward (our own
    autograd Function; Soup's gradient_checkpointing switch stays off), so only the layer input
@@ -40,6 +43,8 @@ import functools
 
 import torch
 
+from . import nf4
+
 ENABLED = True  # stream NF4 weights + recompute layers (needs the store, see below)
 EMBED_HOST = (
     True  # tied fp16 embedding / head weight in pinned host RAM (head_stream.py)
@@ -51,6 +56,15 @@ _STORE = {"store": None}
 
 def _cuda():
     return torch.device("cuda", torch.cuda.current_device())
+
+
+def _align(n, to=16):
+    return (n + to - 1) // to * to
+
+
+def _absmax_count(quant_state):
+    """Number of quantization blocks (one fp32 absmax each) of a weight."""
+    return quant_state.absmax.numel()
 
 
 def _is_nf4_linear(module) -> bool:
@@ -118,13 +132,19 @@ class LayerStore:
         self.layers = list(layers)
         self.index = {id(layer): i for i, layer in enumerate(self.layers)}
         self.host, self.where = [], {}
+        self.absmax_at = {}  # id(quant_state) -> (quant_state, layer, byte offset, count)
         dev = _cuda()
         for i, layer in enumerate(self.layers):
             mods = [m for m in layer.modules() if _is_nf4_linear(m)]
-            total = sum(m.weight.numel() for m in mods)
-            host = torch.empty(total, dtype=torch.uint8, pin_memory=True)
-            off = 0
+            # Layout of a layer's buffer: the NF4 bytes of each weight, then (16-byte aligned)
+            # the fp32 absmax of each weight, so one copy brings both to the GPU slot.
+            absmax_off, off = [], _align(sum(m.weight.numel() for m in mods))
             for m in mods:
+                absmax_off.append(off)
+                off = _align(off + 4 * _absmax_count(m.weight.quant_state))
+            host = torch.empty(off, dtype=torch.uint8, pin_memory=True)
+            off = 0
+            for m, a_off in zip(mods, absmax_off):
                 w = m.weight
                 n = w.numel()
                 host[off : off + n].copy_(
@@ -135,6 +155,12 @@ class LayerStore:
                 _keep_on_host(m)
                 self.where[w.data_ptr()] = (i, off, n)
                 off += n
+                qs = w.quant_state
+                count = _absmax_count(qs)
+                host[a_off : a_off + 4 * count].view(torch.float32).copy_(
+                    nf4.build_absmax_fp32(qs).reshape(-1)
+                )  # rebuilt by bitsandbytes on the GPU, as before; only kept here
+                self.absmax_at[id(qs)] = (qs, i, a_off, count)
             self.host.append(host)
         size = max((h.numel() for h in self.host), default=0)
         self.slots = [
@@ -184,6 +210,17 @@ class LayerStore:
         if self.active == i and self.resident[i % 2] == i:
             return self.slots[i % 2][off : off + n].view(B.shape)
         return B.data.to(_cuda())
+
+    def absmax(self, quant_state):
+        """The fp32 absmax of a streamed weight on the GPU: its slot view while the layer runs
+        here (copied in with the NF4 bytes), otherwise a private copy, as gpu_weight()."""
+        hit = self.absmax_at.get(id(quant_state))
+        if hit is None or hit[0] is not quant_state:
+            return None
+        _, i, off, count = hit
+        if self.active == i and self.resident[i % 2] == i:
+            return self.slots[i % 2][off : off + 4 * count].view(torch.float32)
+        return self.host[i][off : off + 4 * count].view(torch.float32).to(_cuda())
 
     # -- activations
     def to_host(self, h, i):
@@ -284,6 +321,11 @@ def active_store():
     return _STORE["store"] if ENABLED else None
 
 
+def _streamed_absmax(quant_state):
+    store = _STORE["store"]
+    return store.absmax(quant_state) if store is not None else None
+
+
 def build_store(model):
     layers = getattr(getattr(model, "model", None), "layers", None)
     if not isinstance(layers, torch.nn.ModuleList) or not torch.cuda.is_available():
@@ -323,6 +365,7 @@ def patch_matmul_4bit():
 
     bnb.matmul_4bit = matmul_4bit
     bnb._soup_offload = True
+    nf4.ABSMAX_SOURCE = _streamed_absmax  # the fp32 absmax streams with its layer too
 
 
 def _upcast_output(module, inputs, output):

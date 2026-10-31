@@ -70,9 +70,11 @@ Our version:
 - **Our kernel writes the fp16 weight straight from the packed bytes.** It uses the arithmetic
   of bitsandbytes' `csrc/kernels.cu`: `LUT[byte >> 4] * absmax` and `LUT[byte & 15] * absmax`,
   one fp32 multiply each, rounded to fp16 on store.
-- **The absmax of each frozen weight is rebuilt once**, by bitsandbytes itself, and cached
-  (about 80 MB).
-- **Launch arguments are cached per weight** (flat packed view, absmax, LUT, size, grid): the
+- **The absmax of each frozen weight is rebuilt once**, by bitsandbytes itself, and kept
+  (about 82 MB in fp32). With the NF4 weights streamed from host RAM (`offload.py`) it is kept
+  in each layer's pinned buffer, right after the layer's NF4 bytes, and reaches the GPU slot in
+  the same copy; without streaming it is cached on the GPU.
+- **Launch arguments are cached per weight** (flat packed view, LUT, size, grid): the
   hook runs 389 times a step, so the per-call Python work is a dict lookup plus a storage check
   (`data_ptr`, size, dtype, device), since Linear4bit passes a fresh `.t()` view each call. The
   launch itself still goes through `nf4_dequant_kernel[grid](...)`.
