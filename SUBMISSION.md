@@ -1,8 +1,8 @@
 # Submission: JustDoner
 
 ## Links
-- Repository: https://github.com/Adul23/soup-kernel-challenge
-- Final commit: https://github.com/Adul23/soup-kernel-challenge/commit/<FINAL_SHA>
+- Repository: https://github.com/BAITC-Hacks/hack-1d8bdb00-justdoner
+- Final commit: https://github.com/BAITC-Hacks/hack-1d8bdb00-justdoner/commit/<FINAL_SHA>
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   our README): https://www.kaggle.com/code/djparty/soupv3
 - Demo video (up to 3 minutes): <VIDEO_LINK>

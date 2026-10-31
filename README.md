@@ -13,7 +13,7 @@ alone is steadier: 1.83x. An optional switch trades speed for
 memory: **2,277 MiB (6.3x less)** at about 1.19x (see Limits).
 
 **Public Kaggle notebook (the measured run):** https://www.kaggle.com/code/djparty/soupv4  
-**Final commit:** https://github.com/Adul23/soup-kernel-challenge/commit/<FINAL_SHA>
+**Final commit:** https://github.com/BAITC-Hacks/hack-1d8bdb00-justdoner/commit/<FINAL_SHA>
 
 | Kaggle T4, `harness/run_task.py` | Base Soup | Ours | Ratio |
 |---|---|---|---|
@@ -119,6 +119,28 @@ added about 4 s to step 1. A thread inside the same `soup train` process compile
 (`JITFunction.warmup`) while Soup loads and quantizes the model, and the trainer waits for it
 before step 1. It is the same compilation, timed inside the same command, only earlier. Nothing
 is cached across runs. Setting `ENABLED = False` in `warmup.py` restores compile-on-first-use.
+We asked the organizers before relying on this (a thread in the measured process, a fresh cache,
+no other process), and on the fp16 storage of the frozen tied embedding; both were allowed.
+
+### 7. CPU overhead of the `soup train` command itself (`startup.py`)
+
+Two pieces of startup work do not affect the training. We asked the organizers and they allowed
+both, under the conditions noted below. They run inside the measured process, keep nothing
+between runs, and behave the same under measurement and tests. They do not count toward check 4.
+
+- **`importlib.metadata.packages_distributions()`** walks every installed package, about 2.3 s
+  on the Kaggle image. transformers computes it at import, before `apply()` runs, and keeps it;
+  trl computes it again when it is imported. Later callers now get the mapping transformers
+  already computed in this process with the same function. Every caller gets a fresh copy, so
+  no caller can change what another one sees.
+- **`datasets.Dataset.map`** hashes the transform with dill only to name a cache file. Soup
+  builds its datasets in memory (`Dataset.from_list`), where no cache file is ever written or
+  read, and the transform closes over the tokenizer, which is slow to hash. For such datasets
+  (no cache files, no `cache_file_name`, one process) we pass a random `new_fingerprint`, as
+  `datasets` itself does when hashing fails. It comes from `datasets`' own `random.Random`, so
+  the global, NumPy and torch random states are untouched. The mapped rows, their order and
+  everything downstream are identical; Soup's rewind fingerprint hashes the rows themselves.
+  `test_startup.py` checks the rows, the random states and that no hashing happened.
 
 ## Our kernels (check 4: 10.1% of the training time)
 
@@ -132,7 +154,9 @@ is cached across runs. Setting `ENABLED = False` in `warmup.py` restores compile
 ## How to run
 
 On Kaggle (Accelerator **GPU T4 x2**, Internet on), open the public notebook above and press
-**Run All**. It clones this repository at the submitted commit, installs the pinned packages,
+**Run All**. The repository is the hackathon's private one: first add a Kaggle secret
+`GITHUB_TOKEN` (Add-ons → Secrets) with read access to it. The clone cell uses it and never prints
+it. Nothing else needs to be set or edited. It clones this repository at the submitted commit, installs the pinned packages,
 runs our unit tests (`pytest solution`), trains base Soup and our solution, scores both adapters
 and runs the rule checks. It takes about 10 minutes.
 
@@ -149,7 +173,7 @@ python harness/score.py runs/result.json
 SOUP_APPLY_SOLUTION=1 python -m pytest tests -q   # Soup's regression tests with our patches
 ```
 
-`solution.apply()` takes no arguments and installs, in order: RMSNorm, the fused head (model and
+`solution.apply()` takes no arguments and installs, in order: the startup patches, RMSNorm, the fused head (model and
 trainer sides), the NF4 dequantization, the example SwiGLU, the fp16 MLP, MLP unpadding, the
 packed decoder layers and the compile warm-up. To switch one off, comment out its line in
 `solution/__init__.py`. The patches are independent, except that `patch_qwen2_unpad()` and
@@ -217,8 +241,9 @@ it. The training loop of our solution varies much less: 34.4 → 30.6 s from var
 | `solution/mlp_fp16.py` | MLP in fp16 end to end |
 | `solution/mlp_recompute.py` | MLP recomputation (off, see Limits) |
 | `solution/warmup.py` | compiles our kernels during model loading |
+| `solution/startup.py` | the two startup patches (section 7) |
 | `solution/swiglu.py` | the starter kit's example SwiGLU (not ours, not counted) |
-| `solution/test_*.py` | 48 tests: each patch against its reference path |
+| `solution/test_*.py` | 52 tests: each patch against its reference path, plus a 40-step convergence test |
 
 ## Credits
 
