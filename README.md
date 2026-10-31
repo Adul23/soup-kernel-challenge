@@ -12,7 +12,7 @@ base Soup took 90.4 s, which gave 1.67x. In our other sessions it took 77–80 s
 alone is steadier: 1.83x. An optional switch trades speed for
 memory: **2,277 MiB (6.3x less)** at about 1.19x (see Limits).
 
-**Public Kaggle notebook (the measured run):** https://www.kaggle.com/code/djparty/soupv3  
+**Public Kaggle notebook (the measured run):** https://www.kaggle.com/code/djparty/soupv4  
 **Final commit:** https://github.com/Adul23/soup-kernel-challenge/commit/<FINAL_SHA>
 
 | Kaggle T4, `harness/run_task.py` | Base Soup | Ours | Ratio |
