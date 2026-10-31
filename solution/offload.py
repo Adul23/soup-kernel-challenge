@@ -45,6 +45,7 @@ EMBED_HOST = (
     True  # tied fp16 embedding / head weight in pinned host RAM (head_stream.py)
 )
 OFFLOAD_INPUTS = True  # keep the per-layer recompute inputs in pinned host RAM
+ARENA_ROWS = 2048  # tokens per pinned input buffer (batch 4 x max_length 512)
 _STORE = {"store": None}
 
 
@@ -145,6 +146,7 @@ class LayerStore:
         self.h2d = torch.cuda.Stream(device=dev)
         self.d2h = torch.cuda.Stream(device=dev)
         self.active = None  # the layer currently computing with its slot
+        self.arena = {}  # layer -> pinned buffer for its recompute input (reused)
 
     # -- streaming
     def _issue(self, i):
@@ -184,10 +186,20 @@ class LayerStore:
         return B.data.to(_cuda())
 
     # -- activations
-    def to_host(self, h):
+    def to_host(self, h, i):
+        """Layer i's recompute input into its own pinned buffer, allocated once and reused
+        every step (pinned allocations of varying sizes stall the step)."""
         if not OFFLOAD_INPUTS:
             return (h.detach(), None)
-        host = torch.empty(h.shape, dtype=h.dtype, pin_memory=True)
+        numel = h.numel()
+        buf = self.arena.get(i)
+        if buf is None or buf.numel() < numel or buf.dtype != h.dtype:
+            # sized for the largest batch: batch * max_length tokens (4 x 512 here)
+            cap = max(numel, ARENA_ROWS * h.shape[-1])
+            buf = self.arena[i] = torch.empty(cap, dtype=h.dtype, pin_memory=True)
+        host = buf[:numel].view(h.shape)
+        # The previous step's copy back from this buffer was queued on the compute stream; the
+        # side stream waits for everything queued there, so it is done before we overwrite it.
         self.d2h.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.d2h):
             host.copy_(h.detach(), non_blocking=True)
@@ -241,7 +253,7 @@ class _StreamedLayer(torch.autograd.Function):
         with torch.no_grad():
             out = body(h)
         store.release(i)
-        ctx.saved = store.to_host(h)
+        ctx.saved = store.to_host(h, i)
         ctx.params = params
         return out
 
