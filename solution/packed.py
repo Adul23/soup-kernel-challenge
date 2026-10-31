@@ -35,7 +35,7 @@ ENABLED = True
 # input ([n_real, hidden] fp32, ~6 KB per token) is kept per layer. Our own recomputation
 # (torch.utils.checkpoint, non-reentrant, RNG preserved so LoRA dropout replays the same masks);
 # Soup's gradient_checkpointing switch stays off. Costs a second forward of every layer.
-CHECKPOINT_LAYERS = True
+CHECKPOINT_LAYERS = False  # True
 # Attention on the packed tokens themselves: PyTorch's memory-efficient attention kernel (the one
 # SDPA already runs on the T4) called with cu_seqlens, causal within each row. No scatter to the
 # padded batch, and no work on padded queries or keys. Falls back to padded SDPA (with a warning)
