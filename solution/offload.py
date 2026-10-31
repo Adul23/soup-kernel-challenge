@@ -64,6 +64,29 @@ def _is_nf4_linear(module) -> bool:
 # ---------------------------------------------------------------- 1. weights in host RAM
 
 
+def _apply_keep_host(self, fn, recurse=True):
+    """Module._apply that leaves our host-RAM parameters where they are.
+
+    accelerate / Trainer may call model.to(cuda) after Soup built the model; that would copy
+    the streamed weights back to the GPU (and keep them there). Every other parameter, buffer
+    and child is converted as usual."""
+    hidden = {
+        k: p for k, p in self._parameters.items() if getattr(p, "_soup_host", False)
+    }
+    for k in hidden:
+        self._parameters[k] = None  # _apply skips None entries
+    try:
+        type(self)._apply(self, fn, recurse)
+    finally:
+        for k, p in hidden.items():
+            self._parameters[k] = p
+    return self
+
+
+def _keep_on_host(module):
+    module._apply = _apply_keep_host.__get__(module)
+
+
 def patch_params4bit():
     """Packed NF4 bytes go to host RAM right after bitsandbytes quantized them on the GPU."""
     import bitsandbytes as bnb
@@ -108,6 +131,7 @@ class LayerStore:
                 )  # from host or (tests) the GPU
                 w.data = host[off : off + n].view(w.shape)
                 w._soup_host = True
+                _keep_on_host(m)
                 self.where[w.data_ptr()] = (i, off, n)
                 off += n
             self.host.append(host)
@@ -179,7 +203,25 @@ class LayerStore:
         torch.cuda.current_stream().wait_event(done)
         return t.to(_cuda(), non_blocking=True)
 
+    def check_once(self):
+        """Report (once) if something moved our host-RAM weights back to the GPU."""
+        if getattr(self, "_checked", False):
+            return
+        self._checked = True
+        moved = [
+            m
+            for layer in self.layers
+            for m in layer.modules()
+            if _is_nf4_linear(m) and m.weight.is_cuda
+        ]
+        print(
+            f"[solution.offload] first step: {len(moved)} NF4 weights on the GPU "
+            f"(0 expected), {torch.cuda.memory_allocated() / 2**20:.0f} MiB allocated",
+            flush=True,
+        )
+
     def run_layer(self, layer, body, h):
+        self.check_once()
         params = tuple(p for p in layer.parameters() if p.requires_grad)
         try:
             ac = (torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"))
@@ -327,8 +369,10 @@ def move_embedding_to_host(model):
         host = w.data if w.data.is_pinned() else w.data.pin_memory()
     w.data = host
     w._soup_host = True
+    _keep_on_host(embed)
     embed.forward = _host_embedding_forward.__get__(embed)
     if head is not None:
+        _keep_on_host(head)
         head.forward = _host_head_forward.__get__(head)
     torch.cuda.empty_cache()
     print(
