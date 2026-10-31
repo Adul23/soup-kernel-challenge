@@ -1,25 +1,28 @@
-"""Qwen2 decoder layers on the real tokens only; only attention itself sees the padded batch.
+"""Qwen2 decoder layers on the real tokens only, attention included.
 
 unpad.py already skips the pads in the MLP. Everything else in a decoder layer still ran on all
 B*T positions: both RMSNorms, both residual additions, the q/k/v/o projections with their LoRA,
-the fp32<->fp16 casts around them and the rotary embedding. In the base profile those
-element-wise ops are about a quarter of the GPU time. Here the residual stream stays packed as
-[n_real, hidden] from the first layer to the final norm (unpad.py scatters it back to
-[B, T, hidden] when Qwen2Model returns), and a layer runs on the packed rows:
+the fp32<->fp16 casts around them, the rotary embedding and attention itself. Here the residual
+stream stays packed as [n_real, hidden] from the first layer to the final norm (unpad.py scatters
+it back to [B, T, hidden] when Qwen2Model returns), and a layer runs on the packed rows:
 
-    input_layernorm -> q/k/v (+LoRA) -> rotary -> [scatter] SDPA [gather] -> o_proj -> + residual
+    input_layernorm -> q/k/v (+LoRA) -> rotary -> varlen attention -> o_proj -> + residual
     post_attention_layernorm -> MLP -> + residual
 
-Only q/k/v are scattered to the padded [B, heads, T, d] layout for SDPA, whose mask hides the
-pads: a padded key gets probability exactly 0, so its (now zero) value does not reach a real
-query, and padded queries are not read. Every other op works per position, so the real rows get
-the same values as before.
+Attention runs on the packed tokens with PyTorch's memory-efficient attention kernel (the one SDPA
+already uses on the T4) given cu_seqlens, causal within each row: no padded queries or keys at
+all. It needs right padding (each row's real tokens a prefix); otherwise, or if the op is
+unavailable, q/k/v are scattered to the padded layout and go through SDPA as in base Soup, whose
+mask gives padded keys probability exactly 0. Every other op works per position.
 
 LoRA dropout draws random numbers per element, so it is applied to the scattered [B*T, hidden]
 input, as in base Soup: the same number of draws in the same order gives the same mask at every
 real position and leaves the RNG stream where base Soup leaves it. The LoRA matmuls then run on
 the gathered rows. Anything this does not recognise (a LoRA variant, DoRA, merged or disabled
 adapters, no autocast) runs the module on the scattered input and gathers the result back.
+
+CHECKPOINT_LAYERS (off) recomputes every layer in backward instead: 2,277 MiB (6.3x less than
+base Soup) for about 18% less speed. See the README.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ ENABLED = True
 # input ([n_real, hidden] fp32, ~6 KB per token) is kept per layer. Our own recomputation
 # (torch.utils.checkpoint, non-reentrant, RNG preserved so LoRA dropout replays the same masks);
 # Soup's gradient_checkpointing switch stays off. Costs a second forward of every layer.
-CHECKPOINT_LAYERS = False  # True
+CHECKPOINT_LAYERS = False  # True: 2,277 MiB but ~18% slower (README, Limits)
 # Attention on the packed tokens themselves: PyTorch's memory-efficient attention kernel (the one
 # SDPA already runs on the T4) called with cu_seqlens, causal within each row. No scatter to the
 # padded batch, and no work on padded queries or keys. Falls back to padded SDPA (with a warning)
