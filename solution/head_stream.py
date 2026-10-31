@@ -11,10 +11,11 @@ carries each row's online max / sum-exp / entropy sum / first-index argmax / tar
 pieces in fp32 arrays (VCHUNK is a multiple of BLOCK, so the blocks are visited in the same order
 with the same arithmetic as `fused_head_ce_kernel` in head.py; the last piece writes loss,
 entropy, correct and the log-sum-exp). For labelled rows the kernel also overwrites the piece's
-logits with GRAD_SCALE * exp(z - m), relative to the running max m, and returns the factor
-exp(m_before - m); cuBLAS then accumulates acc = acc * factor + P @ W_piece in fp32, as flash
-attention accumulates its output. At the end, softmax @ W = acc / sum-exp, and the hidden-state
-gradient is GRAD_SCALE * (softmax @ W - W[target]). So the weight crosses PCIe once per step and
+logits with GRAD_SCALE * exp(z - m) / d, normalised by the running max m and sum-exp d (a row
+sums to at most GRAD_SCALE, so the fp16 product cannot overflow), and returns the factor
+exp(m_before - m) * d_before / d; cuBLAS then accumulates acc = acc * factor + P @ W_piece in
+fp32, as flash attention accumulates its output. At the end acc = GRAD_SCALE * softmax @ W, and
+the hidden-state gradient is GRAD_SCALE * (softmax @ W - W[target]). So the weight crosses PCIe once per step and
 the logits are computed once, instead of a second pass for the gradient.
 """
 
@@ -82,16 +83,20 @@ def head_chunk_stats_kernel(
         best = tl.maximum(best, bmax)
         zt += tl.sum(tl.where(offs + v0 == tgt, z, 0.0), axis=0)
     # One pass for the gradient too (as flash attention accumulates its output): labelled rows
-    # get P = GRAD_SCALE * exp(z - m) for this piece, relative to the running max m, and ALPHA =
-    # exp(m_before - m) rescales what was accumulated from the earlier pieces.
+    # get P = GRAD_SCALE * exp(z - m) / d for this piece, normalised by the running max m and
+    # sum-exp d, so a row of P sums to at most GRAD_SCALE and P @ W cannot overflow fp16 (as
+    # with the final softmax); ALPHA = exp(m_before - m) * d_before / d rescales what was
+    # accumulated from the earlier pieces (0 for the first piece).
     m_before = tl.where(first, float("-inf"), tl.load(M + row))
+    d_before = tl.where(first, 0.0, tl.load(D + row))
     lab_row = row < KLAB
-    tl.store(ALPHA + row, tl.exp(m_before - m), mask=lab_row)
+    tl.store(ALPHA + row, tl.exp(m_before - m) * (d_before / d), mask=lab_row)
+    scale = GRAD_SCALE / d
     for start in range(0, VC, BLOCK):
         offs = start + tl.arange(0, BLOCK)
         msk = (offs < VC) & lab_row
         z = tl.load(ptr + offs, mask=msk, other=0.0).to(tl.float32)
-        p = tl.exp(z - m) * GRAD_SCALE
+        p = tl.exp(z - m) * scale
         tl.store(ptr + offs, p.to(LOGITS.dtype.element_ty), mask=msk)
     last = LAST != 0
     lse = m + tl.log(d)
@@ -260,17 +265,18 @@ def head_streamed(h, weight_host, tgt, rows_lab, rows_ent, need_grad):
             BLOCK=BLOCK,
             num_warps=8,
         )
-        if want_grad:  # acc = acc * alpha + P @ W_piece, fp32 accumulation
+        if want_grad:  # acc = acc * alpha + P @ W_piece, fp32 accumulation (fp16 products)
             acc.mul_(alpha[:k_lab, None]).add_(torch.mm(out[:k_lab], w))
     token_loss.index_copy_(0, rows, loss_k)
     token_entropy.index_copy_(0, rows, ent_k)
     correct += cor_k.sum()
 
     if want_grad:
-        # GRAD_SCALE * (softmax @ W - W[target]) for the labelled rows; the caller divides
-        # by denominator * GRAD_SCALE, as for the resident head
+        # acc is GRAD_SCALE * softmax @ W now (already normalised); GRAD_SCALE * (softmax @ W -
+        # W[target]) for the labelled rows. The caller divides by denominator * GRAD_SCALE, as
+        # for the resident head.
         t_cpu = t[:k_lab].to("cpu")
         w_tgt = weight_host.index_select(0, t_cpu).to(dev, non_blocking=True)
-        acc.div_(d[:k_lab, None]).sub_(w_tgt.float().mul_(GRAD_SCALE))
+        acc.sub_(w_tgt.float().mul_(GRAD_SCALE))
         grad.index_copy_(0, rows_lab, acc)
     return token_loss, token_entropy, correct, grad

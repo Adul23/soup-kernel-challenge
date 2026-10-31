@@ -45,3 +45,32 @@ def test_streamed_head_matches_resident():
     torch.testing.assert_close(
         g, g_ref, rtol=2e-2, atol=2e-3 * g_ref.abs().max().item()
     )
+
+
+def test_streamed_head_flat_logits_do_not_overflow():
+    """Nearly equal logits over a whole piece with same-sign weights: an unnormalised
+    sum of 256 * exp(z - m) over a piece times W would overflow fp16; the gradient must stay
+    finite and match the resident head."""
+    from solution import head
+
+    torch.manual_seed(0)
+    b, t, dim, v = 2, 24, 64, 20000
+    w = (0.5 + 0.01 * torch.randn(v, dim, device="cuda")).half()
+    hidden = 0.01 * torch.randn(b, t, dim, device="cuda")
+    labels = torch.randint(0, v, (b, t), device="cuda")
+    mask = torch.ones(b, t, dtype=torch.long, device="cuda")
+
+    def run(weight):
+        h = hidden.clone().requires_grad_(True)
+        with torch.autocast("cuda", dtype=torch.float16):
+            loss, _ = head.fused_head_loss(h, weight, labels, attention_mask=mask)
+        loss.backward()
+        return loss.detach(), h.grad
+
+    loss_ref, g_ref = run(w)
+    host = torch.empty(w.shape, dtype=w.dtype, pin_memory=True)
+    host.copy_(w)
+    loss, g = run(host)
+    assert torch.isfinite(g).all()
+    torch.testing.assert_close(loss, loss_ref, rtol=1e-3, atol=1e-4)
+    torch.testing.assert_close(g, g_ref, rtol=2e-2, atol=2e-3 * g_ref.abs().max().item())
